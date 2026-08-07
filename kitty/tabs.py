@@ -948,6 +948,10 @@ class Tab:  # {{{
         return prev
 
     def remove_window(self, window: Window, destroy: bool = True, do_post_removal_update: bool = True) -> None:
+        if destroy:
+            # Before the process is gone, so reopen_closed_window has something
+            # to work with. Detaching goes through here too, with destroy False.
+            get_boss().record_closed_window(window)
         self.windows.remove_window(window)
         if destroy:
             remove_window(self.os_window_id, self.id, window.id)

@@ -1214,6 +1214,9 @@ class Parser:
     def pixel_scroll(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['pixel_scroll'] = to_bool(val)
 
+    def preview_on_select(self, val: str, ans: dict[str, typing.Any]) -> None:
+        ans['preview_on_select'] = to_bool(val)
+
     def placement_strategy(self, val: str, ans: dict[str, typing.Any]) -> None:
         val = val.lower()
         if val not in self.choices_for_placement_strategy:

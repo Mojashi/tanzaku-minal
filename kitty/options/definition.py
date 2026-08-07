@@ -986,6 +986,21 @@ affect text subsequently received by kitty.
 
 
 opt(
+    'preview_on_select',
+    'no',
+    option_type='to_bool',
+    ctype='bool',
+    long_text="""
+Preview a file when its path is selected with the mouse. Selecting the path of an
+existing file, for example in build output or an :code:`ls` listing, opens it in an
+overlay: images are shown with the :code:`icat` kitten, anything else in the pager.
+Selections that are not the path of an existing file are ignored, so this is quiet
+during ordinary text selection. The same thing is available on demand as the
+:ac:`preview_selection` action.
+""",
+)
+
+opt(
     'copy_on_select',
     'no',
     option_type='copy_on_select',

@@ -32,6 +32,7 @@ from kitty.types import WindowResizeDrag
 
 from .child import cached_process_data, default_env, process_data_cache, set_default_env
 from .cli import create_opts, green, parse_args
+from .closed_windows import MAX_CLOSED_WINDOWS, ClosedWindow, relaunch_argv
 from .cli_stub import CLIOptions, SaveAsSessionOptions
 from .clipboard import (
     Clipboard,
@@ -421,6 +422,8 @@ class Boss:
         self.encryption_key = EllipticCurveKey()
         self.encryption_public_key = f'{RC_ENCRYPTION_PROTOCOL_VERSION}:{base64.b85encode(self.encryption_key.public).decode("ascii")}'
         self.clipboard_buffers: dict[str, str] = {}
+        # Most recently closed windows, newest last, for reopen_closed_window.
+        self.closed_windows: list[ClosedWindow] = []
         self.update_check_process: Optional['PopenType[bytes]'] = None
         self.window_id_map: WeakValueDictionary[int, Window] = WeakValueDictionary()
         self.color_settings_at_startup: dict[str, Color | None] = {k: opts[k] for k in opts if isinstance(opts[k], Color) or k in nullable_colors}
@@ -2949,6 +2952,64 @@ class Boss:
                 self.handle_clipboard_loss('primary', w.id)
                 if get_options().copy_on_select:
                     self.copy_to_buffer(get_options().copy_on_select)
+                if get_options().preview_on_select:
+                    self.preview_selection()
+
+    @ac('misc', '''
+        Preview the file the selection refers to, in an overlay
+
+        Does nothing when the selection is not the path of an existing file, so it is
+        safe to trigger on every selection with :opt:`preview_on_select`.
+        ''')
+    def preview_selection(self) -> None:
+        from .constants import kitten_exe
+        from .file_preview import command_for, resolve
+        w = self.active_window
+        if w is None or w.destroyed:
+            return
+        text = w.text_for_selection()
+        if not text:
+            return
+        preview = resolve(text, w.cwd_of_child)
+        if preview is None:
+            return
+        # An overlay keeps the column's own geometry, which matters in layouts
+        # where windows are not interchangeable.
+        self.launch(
+            '--type=overlay', '--cwd', os.path.dirname(preview.path),
+            '--title', os.path.basename(preview.path),
+            *command_for(preview, kitten_exe()))
+
+    def record_closed_window(self, window: Window) -> None:
+        """Remember enough about a window being destroyed to bring it back."""
+        try:
+            cwd = window.cwd_of_child or ''
+            argv = tuple(window.child.foreground_cmdline or ())
+        except Exception:
+            return
+        if not cwd and not argv:
+            return
+        self.closed_windows.append(ClosedWindow(cwd, argv, window.title or ''))
+        del self.closed_windows[:-MAX_CLOSED_WINDOWS]
+
+    @ac('win', '''
+        Reopen the most recently closed window
+
+        Brings back its working directory and the program it was running. Programs that
+        can resume their own state are asked to (:code:`claude` is restarted with
+        :code:`--continue`), so closing a session by accident is recoverable.
+        ''')
+    def reopen_closed_window(self) -> None:
+        if not self.closed_windows:
+            if get_options().enable_audio_bell:
+                ring_bell(self.active_tab.os_window_id if self.active_tab else 0)
+            return
+        rec = self.closed_windows.pop()
+        args = ['--cwd', rec.cwd] if rec.cwd else []
+        if rec.title:
+            args += ['--title', rec.title]
+        args += relaunch_argv(rec.argv)
+        self.launch(*args)
 
     def get_active_selection(self) -> str | None:
         w = self.active_window

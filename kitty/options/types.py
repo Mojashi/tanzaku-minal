@@ -425,6 +425,7 @@ option_names = (
     'placement_strategy',
     'pointer_shape_when_dragging',
     'pointer_shape_when_grabbed',
+    'preview_on_select',
     'progress_bar',
     'remember_window_position',
     'remember_window_size',
@@ -640,6 +641,7 @@ class Options:
     placement_strategy: choices_for_placement_strategy = 'center'
     pointer_shape_when_dragging: tuple[str, str] = ('beam', 'crosshair')
     pointer_shape_when_grabbed: choices_for_pointer_shape_when_grabbed = 'arrow'
+    preview_on_select: bool = False
     progress_bar: choices_for_progress_bar = 'top'
     remember_window_position: bool = False
     remember_window_size: bool = True
