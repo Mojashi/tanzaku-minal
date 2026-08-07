@@ -285,6 +285,15 @@ class Layout:
     must_draw_borders = False  # can be overridden to customize behavior from kittens
     layout_opts = LayoutOpts({})
     only_active_window_visible = False
+    # Set by layouts whose window *geometry* depends on which window is active,
+    # not just which windows are visible. Focus changes normally only refresh
+    # visibility, which is enough for e.g. the stack layout but not for layouts
+    # that scroll a viewport to follow the focus.
+    relayout_on_focus_change = False
+    # Set by layouts that scroll a viewport horizontally. Without this the
+    # horizontal scroll wheel is a no-op unless the program is tracking the
+    # mouse, so nothing is taken away from layouts that do not want it.
+    wants_horizontal_scroll = False
     drag_overlay_mode: ClassVar[DragOverlayMode] = DragOverlayMode.full
 
     def __init__(self, os_window_id: int, tab_id: int, layout_opts: str = '') -> None:
@@ -543,6 +552,13 @@ class Layout:
 
     def layout_action(self, action_name: str, args: Sequence[str], all_windows: WindowList) -> bool | None:
         pass
+
+    def horizontal_scroll(self, delta: float) -> bool:
+        """Scroll the layout viewport horizontally by delta pixels.
+
+        Only called when :attr:`wants_horizontal_scroll` is True. Return True if
+        anything moved, which triggers a relayout."""
+        return False
 
     def on_window_removed(self, all_windows: WindowList) -> bool:
         return False

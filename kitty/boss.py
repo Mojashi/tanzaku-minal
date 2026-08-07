@@ -1545,6 +1545,31 @@ class Boss:
         if tm := self.os_window_map.get(os_window_id):
             tm.handle_tab_bar_mouse(x, y, button, modifiers, action)
 
+    def layout_horizontal_scroll(self, os_window_id: int, delta: float) -> bool:
+        """Horizontal scroll wheel/trackpad event, for layouts that scroll a viewport.
+
+        Returns True if the layout took the event, in which case it is not also
+        delivered to the program running in the window."""
+        tm = self.os_window_map.get(os_window_id)
+        if tm is None:
+            return False
+        tab = tm.active_tab
+        if tab is None:
+            return False
+        layout = tab.current_layout
+        if not layout.wants_horizontal_scroll:
+            return False
+        import os
+        if os.environ.get('KITTY_STRIP_DEBUG'):
+            from .utils import log_error
+            log_error(f'[strip] hscroll delta={delta:+8.2f}')
+        if layout.horizontal_scroll(delta):
+            tab.relayout()
+        # Consumed either way: at the end of the strip the event must not fall
+        # through to the program, or scrolling would suddenly start acting on
+        # whatever is running there.
+        return True
+
     def start_tab_drag(self, os_window_id: int, window_id: int, pixels: bytes, width: int, height: int) -> None:
         if tm := self.os_window_map.get(os_window_id):
             tm.start_tab_drag(pixels, width, height)

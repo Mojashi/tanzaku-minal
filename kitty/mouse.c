@@ -1542,6 +1542,24 @@ pixel_scroll_enabled_for_screen(const Screen *screen) {
     return OPT(pixel_scroll) && screen->linebuf == screen->main_linebuf;
 }
 
+// Returns true if the active layout took the horizontal scroll event, in which
+// case it must not also be delivered to the program. call_boss() discards the
+// return value, so the call is spelled out here.
+static bool
+layout_consumed_horizontal_scroll(id_type os_window_id, double delta_pixels) {
+    bool consumed = false;
+    if (global_state.boss) {
+        PyObject *ret = PyObject_CallMethod(global_state.boss, "layout_horizontal_scroll", "Kd", os_window_id, delta_pixels);
+        if (ret == NULL) {
+            PyErr_Print();
+        } else {
+            consumed = PyObject_IsTrue(ret) == 1;
+            Py_DECREF(ret);
+        }
+    }
+    return consumed;
+}
+
 void
 scroll_event(const GLFWScrollEvent *ev) {
     debug(
@@ -1584,6 +1602,60 @@ scroll_event(const GLFWScrollEvent *ev) {
         }
     }
     Screen *screen = w->render_data.screen;
+
+    // Layouts that scroll a viewport horizontally (e.g. strip) consume the
+    // event. This has to happen even when the program is tracking the mouse:
+    // in such a layout the OS window is a scrollable viewport, and a full
+    // screen TUI would otherwise make it unscrollable.
+    //
+    // It also has to happen *before* the momentum gate below. That gate drops
+    // momentum events whose window differs from the one the gesture started
+    // on, and scrolling a strip slides a different column under a stationary
+    // pointer -- so the glide would die the moment a column boundary crossed
+    // the cursor. Handling it here lets the OS momentum phases through intact.
+    //
+    // Axis lock, per gesture rather than per event. Whichever axis dominates
+    // when a gesture starts owns the whole gesture. A per-event test is not
+    // enough: the sideways jitter of a vertical scroll produces occasional
+    // x-dominant events, which would be stolen from the program and make
+    // vertical scrolling feel like it is dropping input.
+    static int scroll_axis_lock = 0;  // 0 undecided, 1 horizontal, 2 vertical
+    static monotonic_t last_scroll_at = 0;
+    const monotonic_t scroll_now = monotonic();
+    if (scroll_now - last_scroll_at > ms_to_monotonic_t(200)) scroll_axis_lock = 0;
+    last_scroll_at = scroll_now;
+    if (scroll_axis_lock == 0) {
+        const double ax = fabs(ev->x_offset), ay = fabs(ev->y_offset);
+        if (ax > 0.0 || ay > 0.0) scroll_axis_lock = ax > ay ? 1 : 2;
+    }
+    if (ev->momentum_type == GLFW_MOMENTUM_PHASE_ENDED || ev->momentum_type == GLFW_MOMENTUM_PHASE_CANCELED) {
+        scroll_axis_lock = 0;
+    }
+
+    if (scroll_axis_lock == 1 && ev->x_offset != 0.0) {
+        double delta_pixels;
+        if (ev->offset_type == GLFW_SCROLL_OFFEST_HIGHRES) {
+            delta_pixels = ev->x_offset * OPT(touch_scroll_multiplier);
+        } else {
+            delta_pixels = (ev->x_offset / 120.) * OPT(wheel_scroll_multiplier) *
+                           global_state.callback_os_window->fonts_data->fcm.cell_width;
+        }
+        if (layout_consumed_horizontal_scroll(osw->id, delta_pixels)) {
+            // Keep the momentum bookkeeping consistent, otherwise a vertical
+            // scroll started right after a horizontal one would be dropped by
+            // the gate below.
+            switch (ev->momentum_type) {
+                case GLFW_MOMENTUM_PHASE_BEGAN:
+                    window_for_momentum_scroll = w->id;
+                    main_screen_for_momentum_scroll = screen->linebuf == screen->main_linebuf;
+                    break;
+                case GLFW_MOMENTUM_PHASE_ENDED:
+                case GLFW_MOMENTUM_PHASE_CANCELED: window_for_momentum_scroll = 0; break;
+                default: break;
+            }
+            return;
+        }
+    }
 
     switch (ev->momentum_type) {
         case GLFW_NO_MOMENTUM_DATA: break;

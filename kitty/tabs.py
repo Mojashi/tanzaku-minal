@@ -505,6 +505,8 @@ class Tab:  # {{{
         self.mark_tab_bar_dirty()
         self.relayout_borders()
         self.current_layout.update_visibility(self.windows)
+        if self.current_layout.relayout_on_focus_change:
+            self.relayout()
 
     def mark_tab_bar_dirty(self) -> None:
         tm = self.tab_manager_ref()
