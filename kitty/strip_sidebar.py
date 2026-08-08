@@ -63,6 +63,15 @@ def clip_right(text: str, width: int) -> str:
     return out
 
 
+def tmux_has(session: str) -> bool:
+    try:
+        return subprocess.run(
+            ['tmux', 'has-session', '-t', f'={session}'],
+            capture_output=True, timeout=3).returncode == 0
+    except Exception:
+        return False
+
+
 def kill_word(text: str) -> str:
     """Drop the last word, the way alt+backspace does everywhere else."""
     stripped = text.rstrip()
@@ -296,6 +305,24 @@ class UI:
         if not self.hits:
             return
         hit = self.hits[self.sel]
+        # If the conversation is already live in tmux, go to it rather than
+        # starting a second copy of it. c and x name the tmux session after the
+        # conversation precisely so this lookup is exact rather than a guess.
+        prefix = 'claude' if hit.source == 'claude' else 'codex'
+        sess = f'{prefix}-{hit.session[:8]}'
+        if tmux_has(sess):
+            args = [kitten_exe(), '@', 'launch', '--location', 'before', '--title', sess]
+            if hit.cwd and os.path.isdir(hit.cwd):
+                args += ['--cwd', hit.cwd]
+            args += ['--', 'tmux', 'attach', '-t', f'={sess}']
+            try:
+                subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.status = f'attached {sess}'
+            except Exception as e:
+                self.status = f'failed: {e}'
+            self.dirty = True
+            return
+
         # Go through the user's own launcher rather than running the agent
         # directly: c and x set up direnv, the flags they always pass, and the
         # tmux session everything else expects to find.
