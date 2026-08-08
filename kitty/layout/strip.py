@@ -332,9 +332,16 @@ class Strip(Layout):
         self._scroll_active_into_view(all_windows, groups, sizes, view)
         self.offset = max(0, min(self.offset, max_offset))
 
+        # A column is allowed to hang off the right edge of the screen -- the
+        # clipped sliver is what says the strip continues. It is not allowed to
+        # hang under the sidebar: the window there is translucent, so the column
+        # shows through it and reads as the sidebar dragging content along.
         x = 0
         for g, size in zip(groups, sizes):
             if x + size > self.offset and x < self.offset + view:
+                if self._sidebar_px and x + size > self.offset + view:
+                    x += size
+                    continue
                 self._plan.append((g, self.widths[g.id], x - self.offset))
             x += size
         self._more_before = self.offset > 0
@@ -550,7 +557,6 @@ class Strip(Layout):
                 get_boss().close_windows_no_confirm(list(sidebar.windows))
                 self._sidebar_spawning = False
             else:
-                # Force it even when the layout was not configured to have one.
                 self._sidebar_spawning = False
                 self.layout_opts.sidebar = True
                 self._ensure_sidebar()
