@@ -44,6 +44,12 @@ from kitty.window_list import WindowGroup, WindowList
 from .base import BorderLine, DragOverlayMode, Layout, LayoutData, LayoutOpts, lgd
 from .vertical import borders
 
+#: A window carrying this user var is docked to the right edge instead of
+#: scrolling with the strip. Set it with: launch --var strip_sidebar=1
+SIDEBAR_VAR = 'strip_sidebar'
+DEFAULT_SIDEBAR_COLUMNS = 28
+MIN_SIDEBAR_COLUMNS = 12
+
 
 class StripLayoutOpts(LayoutOpts):
 
@@ -94,6 +100,8 @@ class Strip(Layout):
         # Live override of layout_opts.min_columns, so the floor can be dialled
         # in with a keybinding instead of editing the config and reloading.
         self._min_override: int | None = None
+        self._sidebar_px: int = 0
+        self._sidebar_id: int = -1
         return True
 
     @property
@@ -126,14 +134,51 @@ class Strip(Layout):
     def _width_px(self, wg: WindowGroup, cells: int) -> int:
         return cells * lgd.cell_width + self._decoration(wg)
 
-    def _sync_widths(self, groups: Sequence[WindowGroup]) -> None:
+    def _is_sidebar(self, wg: WindowGroup) -> bool:
+        for w in wg.windows:
+            if w.user_vars.get(SIDEBAR_VAR):
+                return True
+        return False
+
+    def _partition(self, all_windows: WindowList) -> tuple[list[WindowGroup], WindowGroup | None]:
+        """Split the scrolling columns from the docked sidebar, if there is one."""
+        scrolling: list[WindowGroup] = []
+        sidebar: WindowGroup | None = None
+        for g in all_windows.iter_all_layoutable_groups():
+            if self._is_sidebar(g):
+                sidebar = g  # if somehow there are several, the last one wins
+            else:
+                scrolling.append(g)
+        return scrolling, sidebar
+
+    def _append_sidebar(self, sidebar: WindowGroup | None, view: int) -> None:
+        if sidebar is None:
+            return
+        cells = max(1, (self._sidebar_px - self._decoration(sidebar)) // lgd.cell_width)
+        # Laid out last so it is on top of a column peeking out from under it.
+        self._plan.append((sidebar, cells, view))
+
+    def _sync_widths(self, groups: Sequence[WindowGroup], sidebar: WindowGroup | None = None) -> None:
         minc = self.min_columns
         live = {g.id for g in groups}
+        if sidebar is not None:
+            live.add(sidebar.id)
         for gid in list(self.widths):
             if gid not in live:
                 del self.widths[gid]
         for g in groups:
             self.widths.setdefault(g.id, minc)
+        if sidebar is not None:
+            # A window is laid out once before its user vars arrive, so the
+            # first time we recognise one it is still carrying a column's width.
+            if sidebar.id != self._sidebar_id:
+                self._sidebar_id = sidebar.id
+                self.widths[sidebar.id] = DEFAULT_SIDEBAR_COLUMNS
+            # The sidebar is a list, not a terminal to work in, so min_columns
+            # does not apply to it.
+            self.widths[sidebar.id] = max(MIN_SIDEBAR_COLUMNS, self.widths[sidebar.id])
+        else:
+            self._sidebar_id = -1
 
     def _sizes(self, groups: Sequence[WindowGroup]) -> list[int]:
         return [self._width_px(g, self.widths[g.id]) for g in groups]
@@ -143,7 +188,7 @@ class Strip(Layout):
 
     # MARK: Scrolling
 
-    def _scroll_active_into_view(self, all_windows: WindowList, groups: Sequence[WindowGroup], sizes: Sequence[int]) -> None:
+    def _scroll_active_into_view(self, all_windows: WindowList, groups: Sequence[WindowGroup], sizes: Sequence[int], view: int) -> None:
         active = all_windows.active_group
         if active is None:
             return
@@ -159,16 +204,14 @@ class Strip(Layout):
             return
         start = sum(sizes[:idx])
         end = start + sizes[idx]
-        view = lgd.central.width
         if start < self.offset:
             self.offset = start
         elif end > self.offset + view:
             self.offset = end - view
 
-    def _first_fully_visible(self, sizes: Sequence[int]) -> int:
+    def _first_fully_visible(self, sizes: Sequence[int], view: int) -> int:
         """Index of the first column entirely inside the viewport."""
         x = 0
-        view = lgd.central.width
         for i, size in enumerate(sizes):
             if x >= self.offset and x + size <= self.offset + view:
                 return i
@@ -184,18 +227,30 @@ class Strip(Layout):
     # MARK: Layout
 
     def _compute_plan(self, all_windows: WindowList) -> None:
-        groups = list(all_windows.iter_all_layoutable_groups())
+        groups, sidebar = self._partition(all_windows)
         self._plan = []
         self._scrolled = False
         self._more_before = False
         self._more_after = False
-        if not groups:
+        self._sidebar_px = 0
+        if not groups and sidebar is None:
             return
-        self._sync_widths(groups)
+        self._sync_widths(groups, sidebar)
+
+        # The sidebar is docked to the right of the viewport: the strip scrolls
+        # underneath it rather than it scrolling with the strip. That also means
+        # the last scrolling column always has a divider on its right, which is
+        # otherwise the one edge in the layout that cannot be grabbed.
+        view = lgd.central.width
+        if sidebar is not None:
+            self._sidebar_px = min(self._width_px(sidebar, self.widths[sidebar.id]), max(0, view // 2))
+            view -= self._sidebar_px
+        if not groups:
+            self._append_sidebar(sidebar, view)
+            return
 
         sizes = self._sizes(groups)
         total = sum(sizes)
-        view = lgd.central.width
 
         if total <= view:
             # Everything fits: stretch to fill, exactly like every other layout.
@@ -214,13 +269,14 @@ class Strip(Layout):
                 assigned += cells
                 self._plan.append((g, cells, x))
                 x += self._width_px(g, cells)
+            self._append_sidebar(sidebar, view)
             return
 
         # Overflowing: scroll the viewport across the strip.
         self._scrolled = True
-        max_offset = self._max_offset(total)
+        max_offset = max(0, total - view)
         self.offset = max(0, min(self.offset, max_offset))
-        self._scroll_active_into_view(all_windows, groups, sizes)
+        self._scroll_active_into_view(all_windows, groups, sizes, view)
         self.offset = max(0, min(self.offset, max_offset))
 
         x = 0
@@ -230,6 +286,7 @@ class Strip(Layout):
             x += size
         self._more_before = self.offset > 0
         self._more_after = self.offset < max_offset
+        self._append_sidebar(sidebar, view)
 
     def update_visibility(self, all_windows: WindowList) -> None:
         self._compute_plan(all_windows)
@@ -323,6 +380,10 @@ class Strip(Layout):
         height_increases_downwards = bool(edges & BOTTOM_EDGE)
         if edges & LEFT_EDGE:
             wg = all_windows.group_for_window(click_window)
+            # The sidebar is docked to the right edge, so its own left edge is
+            # the handle for resizing it: dragging left widens it.
+            if wg is not None and self._is_sidebar(wg):
+                return WindowResizeDragData(click_window.id, False, vertical_id, height_increases_downwards)
             groups = list(all_windows.iter_all_layoutable_groups())
             if wg is not None and wg in groups:
                 idx = groups.index(wg)
@@ -360,15 +421,18 @@ class Strip(Layout):
         if os.environ.get('KITTY_STRIP_DEBUG'):
             from kitty.utils import log_error
             log_error(f'[strip] layout_action {action_name} {list(args)}')
-        groups = list(all_windows.iter_all_layoutable_groups())
+        # The sidebar is docked, so none of these act on it.
+        groups, sidebar = self._partition(all_windows)
         if not groups:
             return None
         self._set_dimensions(all_windows)
-        self._sync_widths(groups)
+        self._sync_widths(groups, sidebar)
         minc = self.min_columns
         sizes = self._sizes(groups)
         total = sum(sizes)
         view = lgd.central.width
+        if sidebar is not None:
+            view -= min(self._width_px(sidebar, self.widths[sidebar.id]), max(0, view // 2))
 
         if action_name == 'scroll':
             if total <= view:
@@ -381,7 +445,7 @@ class Strip(Layout):
             bounds = [0]
             for size in sizes:
                 bounds.append(bounds[-1] + size)
-            max_offset = self._max_offset(total)
+            max_offset = max(0, total - view)
             if delta > 0:
                 target = next((b for b in bounds if b > self.offset + 1), max_offset)
                 new = min(target, max_offset)
@@ -397,7 +461,10 @@ class Strip(Layout):
             idx = groups.index(active) if active in groups else 0
             start = sum(sizes[:idx])
             if start < self.offset or start + sizes[idx] > self.offset + view:
-                all_windows.set_active_group_idx(self._first_fully_visible(sizes))
+                target = groups[self._first_fully_visible(sizes, view)]
+                allg = list(all_windows.iter_all_layoutable_groups())
+                if target in allg:
+                    all_windows.set_active_group_idx(allg.index(target))
             return True
 
         if action_name == 'hscroll':
