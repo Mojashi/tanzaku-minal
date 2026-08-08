@@ -59,6 +59,26 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
 END;
 '''
 
+#: Text that both agents inject into the conversation before the person says
+#: anything. A session summary made of this says nothing about the session.
+BOILERPLATE = (
+    '<recommended_plugins', '<environment_context', '<permissions', '<user_instructions',
+    '# AGENTS.md', '<system-reminder', 'Caveat: The messages below', '<command-name>',
+    '<local-command', '<ide_', 'Analyze this codebase', '[Recent context]',
+    'Caveat:', '<command-message>', 'DO NOT respond to these messages',
+)
+
+
+def is_boilerplate(text: str) -> bool:
+    head = text.lstrip()[:400]
+    for marker in BOILERPLATE:
+        # Not startswith: injected blocks are often wrapped in another tag, or
+        # follow one, so they turn up a little way in rather than at the front.
+        if marker in head:
+            return True
+    return False
+
+
 MAX_TEXT = 1200  # a single tool result can be megabytes; the tail is never the searchable part
 MIN_FREE_BYTES = 3 * 1024 ** 3  # stop indexing rather than fill the disk
 RECENT_SCAN_ROWS = 150_000  # how far back a sub-trigram query scans
@@ -79,6 +99,9 @@ class Hit(NamedTuple):
     role: str
     ts: str
     text: str
+    summary: str = ''   # what the session was asked to do
+    msg_count: int = 0
+    hits: int = 1       # matches in this session, once results are grouped
 
 
 def connect(readonly: bool = False) -> sqlite3.Connection:
@@ -220,7 +243,11 @@ def update(progress: bool = False, budget: float = 0.0) -> tuple[int, int]:
             if rows:
                 db.executemany(
                     'INSERT INTO messages(session, source, role, ts, text) VALUES (?,?,?,?,?)', rows)
-            summary = next((t for _s, _so, r, _t, t in rows if r == 'user'), '')[:200]
+            summary = ''
+            for _s, _so, role, _t, text in rows:
+                if role == 'user' and not is_boilerplate(text):
+                    summary = ' '.join(text.split())[:200]
+                    break
             db.execute(
                 '''INSERT INTO sessions(session, source, cwd, path, first_ts, last_ts, msg_count, summary)
                    VALUES (?,?,?,?,?,?,?,?)
@@ -258,7 +285,8 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
     if not query:
         # Project filter on its own: the most recent thing said in it, which is
         # a useful way in even when you cannot remember any of the words.
-        sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text
+        sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
+                        COALESCE(s.summary,''), COALESCE(s.msg_count,0)
                  FROM messages m
                  JOIN sessions s ON s.session = m.session
                  WHERE 1=1'''
@@ -272,13 +300,15 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
             'SELECT ts FROM messages WHERE ts != \'\' ORDER BY ts DESC LIMIT 1 OFFSET ?',
             (RECENT_SCAN_ROWS,)).fetchone()
         floor = row[0] if row else ''
-        sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text
+        sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
+                        COALESCE(s.summary,''), COALESCE(s.msg_count,0)
                  FROM messages m
                  LEFT JOIN sessions s ON s.session = m.session
                  WHERE m.ts > ? AND m.text LIKE ? ESCAPE '\\' '''
         args = [floor, '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%']
     else:
-        sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text
+        sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
+                        COALESCE(s.summary,''), COALESCE(s.msg_count,0)
                  FROM messages_fts f
                  JOIN messages m ON m.id = f.rowid
                  LEFT JOIN sessions s ON s.session = m.session
@@ -294,24 +324,29 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
     # before LIMIT could apply, which on the substring path means scanning every
     # message. Duplicates are collapsed below instead, where it costs nothing.
     sql += ' ORDER BY m.ts DESC LIMIT ?'
-    args.append(limit * 3)
+    # Rows are messages but results are sessions, and one busy session can
+    # easily contribute hundreds of rows, so fetch well past the target.
+    args.append(max(limit * 40, 2000))
     try:
         rows = db.execute(sql, args).fetchall()
     except sqlite3.Error:
         rows = []
     db.close()
-    seen = set()
-    ans = []
+    # One row per conversation. Ten hits in one session are one answer to
+    # "which conversation was this", not ten, and they used to crowd out every
+    # other session in the results.
+    order: list[str] = []
+    best: dict[str, Hit] = {}
+    counts: dict[str, int] = {}
     for r in rows:
         hit = Hit(*r)
-        key = (hit.session, hit.text)
-        if key in seen:
-            continue
-        seen.add(key)
-        ans.append(hit)
-        if len(ans) >= limit:
-            break
-    return ans
+        counts[hit.session] = counts.get(hit.session, 0) + 1
+        if hit.session not in best:
+            best[hit.session] = hit
+            order.append(hit.session)
+            if len(order) >= limit:
+                break
+    return [best[s]._replace(hits=counts[s]) for s in order]
 
 
 def stats() -> tuple[int, int]:

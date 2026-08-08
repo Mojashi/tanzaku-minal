@@ -201,7 +201,7 @@ class UI:
         # box off the top, and there is no scrollback worth having here.
         header = 5 + (1 if (self.status or self.searching) else 0)
         rows = max(0, h - header - 1)
-        per = 3
+        per = 4
         capacity = max(1, rows // per)
         if self.sel < self.top:
             self.top = self.sel
@@ -218,7 +218,14 @@ class UI:
             tag = f'{BLUE}cx{R}' if hit.source == 'codex' else f'{GREEN}cc{R}'
             head = f'{BOLD if cur else ""}{fit(home_relative(hit.cwd) or "?", inner - 8)}{R}'
             out.append(f'{bar}{tag} {head}')
-            meta = f'{hit.role[:9]} {hit.ts[:16].replace("T", " ")}'
+            # What the conversation was for, which the matching line on its own
+            # rarely says. Without it every result is a fragment out of context.
+            if hit.summary:
+                out.append(f'  {fit(hit.summary, inner - 2)}')
+            else:
+                out.append(f'  {DIM}(no summary){R}')
+            extra = f' ·{hit.hits} hits' if hit.hits > 1 else ''
+            meta = f'{hit.ts[:10]} {hit.ts[11:16]} · {hit.msg_count} msgs{extra}'
             out.append(f'  {DIM}{fit(meta, inner - 2)}{R}')
             out.append(f'  {DIM}{snippet(hit.text, self.query, inner - 3)}{R}')
             shown_rows += per
