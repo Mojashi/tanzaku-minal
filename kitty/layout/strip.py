@@ -49,6 +49,7 @@ from .vertical import borders
 SIDEBAR_VAR = 'strip_sidebar'
 DEFAULT_SIDEBAR_COLUMNS = 44
 MIN_SIDEBAR_COLUMNS = 20
+WIDE_SIDEBAR_COLUMNS = 110  # reading width, for the toggle
 
 
 class StripLayoutOpts(LayoutOpts):
@@ -75,6 +76,7 @@ class Strip(Layout):
     # visibility) changes when the active window changes.
     relayout_on_focus_change = True
     wants_horizontal_scroll = True
+    cares_about_user_vars = True
     drag_overlay_mode = DragOverlayMode.axis_y
     layout_opts = StripLayoutOpts({})
 
@@ -105,6 +107,7 @@ class Strip(Layout):
         self._sidebar_px: int = 0
         self._sidebar_id: int = -1
         self._sidebar_spawning: bool = False
+        self._sidebar_narrow: int = 0  # width to come back to after widening
         return True
 
     @property
@@ -183,6 +186,17 @@ class Strip(Layout):
         except Exception:
             self._sidebar_spawning = False
 
+    def _request_relayout(self) -> None:
+        from kitty.fast_data_types import add_timer
+
+        def later(timer_id: int | None = None) -> None:
+            from kitty.boss import get_boss
+            tab = get_boss().tab_for_id(self.tab_id)
+            if tab is not None and tab.current_layout is self:
+                tab.relayout()
+
+        add_timer(later, 0.01, False)
+
     def _append_sidebar(self, sidebar: WindowGroup | None, view: int) -> None:
         if sidebar is None:
             return
@@ -206,6 +220,10 @@ class Strip(Layout):
             if sidebar.id != self._sidebar_id:
                 self._sidebar_id = sidebar.id
                 self.widths[sidebar.id] = DEFAULT_SIDEBAR_COLUMNS
+                # The window was laid out as an ordinary column before its user
+                # vars arrived, so it is still carrying that geometry. Nothing
+                # else will ask for a relayout, so ask for one here.
+                self._request_relayout()
             # The sidebar is a list, not a terminal to work in, so min_columns
             # does not apply to it.
             self.widths[sidebar.id] = max(MIN_SIDEBAR_COLUMNS, self.widths[sidebar.id])
@@ -500,6 +518,30 @@ class Strip(Layout):
                 allg = list(all_windows.iter_all_layoutable_groups())
                 if target in allg:
                     all_windows.set_active_group_idx(allg.index(target))
+            return True
+
+        if action_name == 'sidebar_width':
+            # Widening to read a result and going back again is a different
+            # gesture from dragging to a size and leaving it there.
+            if sidebar is None:
+                return None
+            cur = self.widths[sidebar.id]
+            arg = args[0] if args else 'toggle'
+            if arg == 'toggle':
+                if cur > DEFAULT_SIDEBAR_COLUMNS:
+                    new = self._sidebar_narrow or DEFAULT_SIDEBAR_COLUMNS
+                else:
+                    self._sidebar_narrow = cur
+                    new = WIDE_SIDEBAR_COLUMNS
+            else:
+                try:
+                    new = cur + int(arg) if arg[0] in '+-' else int(arg)
+                except Exception:
+                    return None
+            new = max(MIN_SIDEBAR_COLUMNS, new)
+            if new == cur:
+                return None
+            self.widths[sidebar.id] = new
             return True
 
         if action_name == 'sidebar':

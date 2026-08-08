@@ -22,6 +22,7 @@ import unicodedata
 import selectors
 import shutil
 import signal
+import shlex
 import subprocess
 import sys
 import termios
@@ -45,6 +46,21 @@ GREEN = '\033[38;5;149m'
 BLUE = '\033[38;5;110m'
 GREY = '\033[38;5;244m'
 HIT = '\033[38;5;214m\033[1m'
+
+
+def clip_right(text: str, width: int) -> str:
+    """Keep the tail of text that fits in width display columns."""
+    if width <= 0:
+        return ''
+    out = ''
+    used = 0
+    for ch in reversed(text):
+        w = 2 if unicodedata.east_asian_width(ch) in 'WF' else 1
+        if used + w > width:
+            break
+        out = ch + out
+        used += w
+    return out
 
 
 def kill_word(text: str) -> str:
@@ -150,15 +166,18 @@ class UI:
         inner = max(10, w - 1)
         out: list[str] = []
 
-        def field(label: str, value: str, active: bool) -> str:
-            room = inner - 4 - len(label)
-            shown = value[-room:] if room > 0 else ''
+        # The border lines are inner columns wide, so a field line has to be
+        # too: two for the box sides, the label, then the value and its padding.
+        label_w = 2
+        room = inner - 2 - label_w
+
+        def field(label: str, shown: str, active: bool) -> str:
             pad = ' ' * max(0, room - width_of(shown))
             tint = AMBER if active else DIM
             return f'{DIM}│{R}{tint}{label}{R}{shown}{pad}{DIM}│{R}'
 
-        qshown = self.query[-(inner - 6):] if inner > 6 else ''
-        pshown = self.project[-(inner - 6):] if inner > 6 else ''
+        qshown = clip_right(self.query, room)
+        pshown = clip_right(self.project, room)
         out.append(f'{DIM}┌{"─" * (inner - 2)}┐{R}')
         out.append(field('/ ', qshown, self.focus == 0))
         out.append(field('@ ', pshown, self.focus == 1))
@@ -200,7 +219,7 @@ class UI:
             out.append(f'{DIM} {msg}{R}')
 
         cur_row = 2 if self.focus == 0 else 3
-        cur_col = 4 + width_of(qshown if self.focus == 0 else pshown)
+        cur_col = 1 + label_w + 1 + width_of(qshown if self.focus == 0 else pshown)
         return out, cur_row, cur_col
 
     def draw(self) -> None:
@@ -277,11 +296,20 @@ class UI:
         if not self.hits:
             return
         hit = self.hits[self.sel]
-        cmd = ['claude', '--resume', hit.session] if hit.source == 'claude' else ['codex', 'resume', hit.session]
+        # Go through the user's own launcher rather than running the agent
+        # directly: c and x set up direnv, the flags they always pass, and the
+        # tmux session everything else expects to find.
+        fn = 'c' if hit.source == 'claude' else 'x'
+        resume = f'--resume {shlex.quote(hit.session)}' if hit.source == 'claude' \
+            else f'resume {shlex.quote(hit.session)}'
+        line = f'{fn} {resume}'
+        if hit.cwd and os.path.isdir(hit.cwd):
+            line = f'cd {shlex.quote(hit.cwd)} && {line}'
         args = [kitten_exe(), '@', 'launch', '--location', 'before', '--title', hit.session[:8]]
         if hit.cwd and os.path.isdir(hit.cwd):
             args += ['--cwd', hit.cwd]
-        args += ['--'] + cmd
+        # -i so the functions from .zshrc are defined.
+        args += ['--', 'zsh', '-ic', line]
         try:
             # Fire and forget: waiting on this would freeze the input thread.
             subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

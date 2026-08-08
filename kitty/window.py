@@ -1347,6 +1347,12 @@ class Window:
             self.call_watchers(self.watchers.on_set_user_var, {'key': key, 'value': val})
         else:
             self.call_watchers(self.watchers.on_set_user_var, {'key': key, 'value': None})
+        # A user var can decide where a window belongs, and they arrive after the
+        # window has already been laid out once, so the layout has to be given a
+        # chance to place it again.
+        tab = self.tabref()
+        if tab is not None and tab.current_layout.cares_about_user_vars:
+            tab.relayout()
 
     # screen callbacks {{{
 

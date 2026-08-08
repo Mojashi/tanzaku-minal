@@ -294,6 +294,9 @@ class Layout:
     # horizontal scroll wheel is a no-op unless the program is tracking the
     # mouse, so nothing is taken away from layouts that do not want it.
     wants_horizontal_scroll = False
+    # Set by layouts that place a window according to its user vars, which
+    # arrive after the window has already been laid out once.
+    cares_about_user_vars = False
     drag_overlay_mode: ClassVar[DragOverlayMode] = DragOverlayMode.full
 
     def __init__(self, os_window_id: int, tab_id: int, layout_opts: str = '') -> None:
