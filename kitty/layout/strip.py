@@ -47,22 +47,24 @@ from .vertical import borders
 #: A window carrying this user var is docked to the right edge instead of
 #: scrolling with the strip. Set it with: launch --var strip_sidebar=1
 SIDEBAR_VAR = 'strip_sidebar'
-DEFAULT_SIDEBAR_COLUMNS = 28
-MIN_SIDEBAR_COLUMNS = 12
+DEFAULT_SIDEBAR_COLUMNS = 44
+MIN_SIDEBAR_COLUMNS = 20
 
 
 class StripLayoutOpts(LayoutOpts):
 
     min_columns: int = 80
+    sidebar: bool = False
 
     def __init__(self, data: dict[str, str]):
         try:
             self.min_columns = max(1, int(data.get('min_columns', 80)))
         except Exception:
             self.min_columns = 80
+        self.sidebar = data.get('sidebar', 'no').lower() in ('y', 'yes', 'true', '1')
 
     def serialized(self) -> dict[str, Any]:
-        return {'min_columns': self.min_columns}
+        return {'min_columns': self.min_columns, 'sidebar': self.sidebar}
 
 
 class Strip(Layout):
@@ -102,6 +104,7 @@ class Strip(Layout):
         self._min_override: int | None = None
         self._sidebar_px: int = 0
         self._sidebar_id: int = -1
+        self._sidebar_spawning: bool = False
         return True
 
     @property
@@ -150,6 +153,35 @@ class Strip(Layout):
             else:
                 scrolling.append(g)
         return scrolling, sidebar
+
+    def _ensure_sidebar(self) -> None:
+        """Ask for a sidebar to be created, if the layout is meant to have one."""
+        if not self.layout_opts.sidebar or self._sidebar_spawning:
+            return
+        self._sidebar_spawning = True
+        # Creating a window from inside a layout pass would re-enter it, so let
+        # the event loop come back to us first.
+        from kitty.fast_data_types import add_timer
+        add_timer(self._spawn_sidebar, 0.01, False)
+
+    def _spawn_sidebar(self, timer_id: int | None = None) -> None:
+        from kitty.boss import get_boss
+        from kitty.constants import kitty_exe
+        from kitty.launch import launch, parse_launch_args
+        boss = get_boss()
+        tab = boss.tab_for_id(self.tab_id)
+        if tab is None or tab.current_layout is not self:
+            self._sidebar_spawning = False
+            return
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'strip_sidebar.py')
+        opts, args = parse_launch_args([
+            '--var', f'{SIDEBAR_VAR}=1', '--title', 'sessions', '--keep-focus',
+            kitty_exe(), '+launch', script,
+        ])
+        try:
+            launch(boss, opts, args, target_tab=tab, force_target_tab=True)
+        except Exception:
+            self._sidebar_spawning = False
 
     def _append_sidebar(self, sidebar: WindowGroup | None, view: int) -> None:
         if sidebar is None:
@@ -242,7 +274,10 @@ class Strip(Layout):
         # the last scrolling column always has a divider on its right, which is
         # otherwise the one edge in the layout that cannot be grabbed.
         view = lgd.central.width
-        if sidebar is not None:
+        if sidebar is None:
+            self._ensure_sidebar()
+        else:
+            self._sidebar_spawning = False
             self._sidebar_px = min(self._width_px(sidebar, self.widths[sidebar.id]), max(0, view // 2))
             view -= self._sidebar_px
         if not groups:
@@ -465,6 +500,18 @@ class Strip(Layout):
                 allg = list(all_windows.iter_all_layoutable_groups())
                 if target in allg:
                     all_windows.set_active_group_idx(allg.index(target))
+            return True
+
+        if action_name == 'sidebar':
+            if sidebar is not None:
+                from kitty.boss import get_boss
+                get_boss().close_windows_no_confirm(list(sidebar.windows))
+                self._sidebar_spawning = False
+            else:
+                # Force it even when the layout was not configured to have one.
+                self._sidebar_spawning = False
+                self.layout_opts.sidebar = True
+                self._ensure_sidebar()
             return True
 
         if action_name == 'hscroll':
