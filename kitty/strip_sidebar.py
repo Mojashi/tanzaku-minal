@@ -47,6 +47,19 @@ GREY = '\033[38;5;244m'
 HIT = '\033[38;5;214m\033[1m'
 
 
+def kill_word(text: str) -> str:
+    """Drop the last word, the way alt+backspace does everywhere else."""
+    stripped = text.rstrip()
+    if not stripped:
+        return ''
+    # Japanese has no spaces, so fall back to dropping a run of the same kind
+    # of character rather than swallowing the whole field.
+    cut = max(stripped.rfind(' '), stripped.rfind('/'))
+    if cut >= 0:
+        return stripped[:cut + 1]
+    return ''
+
+
 def width_of(text: str) -> int:
     """Display columns, so the cursor lands where CJK text actually ends."""
     return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in text)
@@ -288,6 +301,8 @@ class UI:
         elif data == b'\t':
             self.focus = 1 - self.focus
             self.dirty = True
+        elif data in (b'\x1b\x7f', b'\x1b\x08', b'\x17'):  # alt+backspace, ctrl-w
+            self.set_field(kill_word(self.field()))
         elif data in (b'\x7f', b'\b'):
             self.set_field(self.field()[:-1])
         elif data == b'\x15':  # ctrl-u
