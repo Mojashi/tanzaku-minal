@@ -248,14 +248,22 @@ def escape(query: str) -> str:
 
 def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> list[Hit]:
     query = query.strip()
-    if not query:
+    if not query and not cwd:
         return []
     try:
         db = connect(readonly=True)
     except sqlite3.Error:
         return []
     args: list[Any]
-    if len(query) < 3:
+    if not query:
+        # Project filter on its own: the most recent thing said in it, which is
+        # a useful way in even when you cannot remember any of the words.
+        sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text
+                 FROM messages m
+                 JOIN sessions s ON s.session = m.session
+                 WHERE 1=1'''
+        args = []
+    elif len(query) < 3:
         # The trigram tokenizer cannot index anything shorter than three
         # characters, which rules out most two character Japanese words. Scan
         # instead -- but bounded to recent history, because a scan of the whole

@@ -108,6 +108,11 @@ class UI:
 
     def __init__(self) -> None:
         self.query = ''
+        # Kept apart from the query on purpose: narrowing to a project is a
+        # different question from searching for words, and mixing them into one
+        # box means inventing a syntax to tell them apart.
+        self.project = ''
+        self.focus = 0  # 0 = query, 1 = project
         self.hits: list[Hit] = []
         self.sel = 0
         self.top = 0
@@ -119,23 +124,31 @@ class UI:
         # seconds, indexing longer, and neither may hold up a keystroke.
         self.lock = threading.Lock()
         self.wake = threading.Condition(self.lock)
-        self.want = ''
-        self.running = ''
+        self.want: tuple[str, str] = ('', '')
+        self.running: tuple[str, str] = ('', '')
         self.searching = False
         self.alive = True
         self.size = shutil.get_terminal_size((30, 40))
 
     # MARK: drawing
 
-    def compose(self) -> tuple[list[str], int]:
+    def compose(self) -> tuple[list[str], int, int]:
         w, h = self.size.columns, self.size.lines
         inner = max(10, w - 1)
         out: list[str] = []
 
-        # search box
+        def field(label: str, value: str, active: bool) -> str:
+            room = inner - 4 - len(label)
+            shown = value[-room:] if room > 0 else ''
+            pad = ' ' * max(0, room - width_of(shown))
+            tint = AMBER if active else DIM
+            return f'{DIM}│{R}{tint}{label}{R}{shown}{pad}{DIM}│{R}'
+
+        qshown = self.query[-(inner - 6):] if inner > 6 else ''
+        pshown = self.project[-(inner - 6):] if inner > 6 else ''
         out.append(f'{DIM}┌{"─" * (inner - 2)}┐{R}')
-        shown = self.query[-(inner - 5):]
-        out.append(f'{DIM}│{R} {shown}{" " * max(0, inner - 4 - len(shown))}{DIM}│{R}')
+        out.append(field('/ ', qshown, self.focus == 0))
+        out.append(field('@ ', pshown, self.focus == 1))
         out.append(f'{DIM}└{"─" * (inner - 2)}┘{R}')
 
         label = 'searching…' if self.searching else self.status
@@ -145,7 +158,7 @@ class UI:
 
         # Everything after the box has to fit: one line too many scrolls the
         # box off the top, and there is no scrollback worth having here.
-        header = 4 + (1 if (self.status or self.searching) else 0)
+        header = 5 + (1 if (self.status or self.searching) else 0)
         rows = max(0, h - header - 1)
         per = 3
         capacity = max(1, rows // per)
@@ -170,13 +183,15 @@ class UI:
             shown_rows += per
 
         if not self.hits:
-            msg = 'type to search' if len(self.query) < MIN_QUERY else 'no matches'
+            msg = 'type to search' if (len(self.query) < MIN_QUERY and not self.project) else 'no matches'
             out.append(f'{DIM} {msg}{R}')
 
-        return out, 3 + width_of(shown)
+        cur_row = 2 if self.focus == 0 else 3
+        cur_col = 4 + width_of(qshown if self.focus == 0 else pshown)
+        return out, cur_row, cur_col
 
     def draw(self) -> None:
-        lines, cursor_col = self.compose()
+        lines, cursor_row, cursor_col = self.compose()
         h = self.size.lines
         parts = []
         for i in range(h):
@@ -187,7 +202,7 @@ class UI:
         # sit in the search box. Hiding the cursor, or clearing the screen out
         # from under it on every keystroke, is what made typing Japanese here
         # unusable.
-        parts.append(f'\033[2;{cursor_col}H')
+        parts.append(f'\033[{cursor_row};{cursor_col}H')
         sys.stdout.write(''.join(parts))
         sys.stdout.flush()
         self.dirty = False
@@ -196,14 +211,14 @@ class UI:
 
     def run_query(self) -> None:
         """Hand the query to the worker; never search on the input thread."""
-        if len(self.query) < MIN_QUERY:
+        if len(self.query) < MIN_QUERY and not self.project:
             self.hits = []
             self.status = ''
             self.sel = self.top = 0
             self.dirty = True
             return
         with self.wake:
-            self.want = self.query
+            self.want = (self.query, self.project)
             self.wake.notify()
         self.searching = True
         self.dirty = True
@@ -219,7 +234,7 @@ class UI:
                 self.running = query
             t = time.monotonic()
             try:
-                hits = search(query, limit=300)
+                hits = search(query[0], limit=300, cwd=query[1])
             except Exception as e:
                 hits, note = [], str(e)[:40]
             else:
@@ -270,12 +285,13 @@ class UI:
             return False
         if data in (b'\r', b'\n'):
             self.open_selected()
+        elif data == b'\t':
+            self.focus = 1 - self.focus
+            self.dirty = True
         elif data in (b'\x7f', b'\b'):
-            self.query = self.query[:-1]
-            self.schedule()
+            self.set_field(self.field()[:-1])
         elif data == b'\x15':  # ctrl-u
-            self.query = ''
-            self.schedule()
+            self.set_field('')
         elif data in (b'\x1b[A', b'\x10'):  # up, ctrl-p
             self.sel = max(0, self.sel - 1)
             self.dirty = True
@@ -283,25 +299,34 @@ class UI:
             self.sel = min(max(0, len(self.hits) - 1), self.sel + 1)
             self.dirty = True
         elif data == b'\x1b':
-            self.query = ''
-            self.schedule()
+            self.set_field('')
         elif data and data[0] >= 32:
             self.inbuf += data
             while self.inbuf:
                 try:
-                    self.query += self.inbuf.decode('utf-8')
+                    self.set_field(self.field() + self.inbuf.decode('utf-8'))
                     self.inbuf = b''
                     break
                 except UnicodeDecodeError as e:
                     if e.end >= len(self.inbuf):
                         # a sequence split across reads; wait for the rest
-                        self.query += self.inbuf[:e.start].decode('utf-8')
+                        self.set_field(self.field() + self.inbuf[:e.start].decode('utf-8'))
                         self.inbuf = self.inbuf[e.start:]
                         break
-                    self.query += self.inbuf[:e.start].decode('utf-8')
+                    self.set_field(self.field() + self.inbuf[:e.start].decode('utf-8'))
                     self.inbuf = self.inbuf[e.end:]
             self.schedule()
         return True
+
+    def field(self) -> str:
+        return self.query if self.focus == 0 else self.project
+
+    def set_field(self, value: str) -> None:
+        if self.focus == 0:
+            self.query = value
+        else:
+            self.project = value
+        self.schedule()
 
     def schedule(self) -> None:
         self.pending = time.monotonic() + DEBOUNCE
