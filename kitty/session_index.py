@@ -35,7 +35,11 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE TABLE IF NOT EXISTS sessions (
     session TEXT PRIMARY KEY, source TEXT, cwd TEXT, path TEXT,
-    first_ts TEXT, last_ts TEXT, msg_count INTEGER, summary TEXT
+    first_ts TEXT, last_ts TEXT, msg_count INTEGER, summary TEXT,
+    -- How the session stopped: '' finished, 'error' died on an API failure,
+    -- 'cut' ended mid-turn with the agent never answering, 'stopped' was
+    -- interrupted on purpose.
+    ending TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_ts DESC);
 CREATE TABLE IF NOT EXISTS messages (
@@ -92,6 +96,14 @@ def free_bytes() -> int:
         return 1 << 62
 
 
+#: Markers an agent writes when the person stops it on purpose. Ending on one of
+#: these means the session was abandoned deliberately, which is not the same as
+#: being cut off, and telling the two apart is the whole point of the flag.
+DELIBERATE_STOP = (
+    '<turn_aborted>', '[Request interrupted by user',
+)
+
+
 class Hit(NamedTuple):
     session: str
     source: str
@@ -102,6 +114,7 @@ class Hit(NamedTuple):
     summary: str = ''   # what the session was asked to do
     msg_count: int = 0
     hits: int = 1       # matches in this session, once results are grouped
+    ending: str = ''    # '', 'error', 'cut' or 'stopped'
 
 
 def connect(readonly: bool = False) -> sqlite3.Connection:
@@ -134,8 +147,8 @@ def flatten(content: Any) -> str:
     return str(content)
 
 
-def claude_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str, str]]:
-    """(role, ts, text, cwd) for a Claude Code session file."""
+def claude_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str, str, bool]]:
+    """(role, ts, text, cwd, is_error) for a Claude Code session file."""
     with open(path, encoding='utf-8', errors='replace') as f:
         for i, line in enumerate(f):
             if i < start_line or not line.strip():
@@ -152,10 +165,13 @@ def claude_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str,
             role = msg.get('role') or d.get('type') or ''
             text = flatten(msg.get('content'))
             if text:
-                yield role, d.get('timestamp') or '', text[:MAX_TEXT], d.get('cwd') or ''
+                # Claude marks these itself, so a session that died on a
+                # connection failure is a fact rather than a guess.
+                yield (role, d.get('timestamp') or '', text[:MAX_TEXT], d.get('cwd') or '',
+                       bool(d.get('isApiErrorMessage')))
 
 
-def codex_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str, str]]:
+def codex_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str, str, bool]]:
     """(role, ts, text, cwd) for a Codex rollout file, old and new layouts."""
     cwd = ''
     with open(path, encoding='utf-8', errors='replace') as f:
@@ -180,7 +196,8 @@ def codex_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str, 
                 continue
             text = flatten(payload.get('content'))
             if text:
-                yield role, d.get('timestamp') or payload.get('timestamp') or '', text[:MAX_TEXT], cwd
+                yield (role, d.get('timestamp') or payload.get('timestamp') or '',
+                       text[:MAX_TEXT], cwd, False)
 
 
 def session_files() -> Iterator[tuple[str, str, str]]:
@@ -230,8 +247,11 @@ def update(progress: bool = False, budget: float = 0.0) -> tuple[int, int]:
         cwd = ''
         first_ts = last_ts = ''
         try:
-            for n, (role, ts, text, c) in enumerate(reader(path, start_line)):
+            last_role = last_text = ''
+            last_error = False
+            for n, (role, ts, text, c, err) in enumerate(reader(path, start_line)):
                 cwd = c or cwd
+                last_role, last_text, last_error = role, text, err
                 if ts:
                     first_ts = first_ts or ts
                     last_ts = ts
@@ -243,20 +263,29 @@ def update(progress: bool = False, budget: float = 0.0) -> tuple[int, int]:
             if rows:
                 db.executemany(
                     'INSERT INTO messages(session, source, role, ts, text) VALUES (?,?,?,?,?)', rows)
+            if last_error:
+                ending = 'error'
+            elif any(m in last_text for m in DELIBERATE_STOP):
+                ending = 'stopped'
+            elif last_role == 'user' and not is_boilerplate(last_text):
+                ending = 'cut'
+            else:
+                ending = ''
             summary = ''
             for _s, _so, role, _t, text in rows:
                 if role == 'user' and not is_boilerplate(text):
                     summary = ' '.join(text.split())[:200]
                     break
             db.execute(
-                '''INSERT INTO sessions(session, source, cwd, path, first_ts, last_ts, msg_count, summary)
-                   VALUES (?,?,?,?,?,?,?,?)
+                '''INSERT INTO sessions(session, source, cwd, path, first_ts, last_ts, msg_count, summary, ending)
+                   VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(session) DO UPDATE SET
                      cwd=COALESCE(NULLIF(excluded.cwd,''), sessions.cwd),
                      last_ts=COALESCE(NULLIF(excluded.last_ts,''), sessions.last_ts),
                      msg_count=excluded.msg_count,
-                     summary=COALESCE(NULLIF(sessions.summary,''), excluded.summary)''',
-                (session, source, cwd, path, first_ts, last_ts, count, summary))
+                     summary=COALESCE(NULLIF(sessions.summary,''), excluded.summary),
+                     ending=excluded.ending''',
+                (session, source, cwd, path, first_ts, last_ts, count, summary, ending))
             db.execute('INSERT OR REPLACE INTO files(path, size, mtime, msg_count) VALUES (?,?,?,?)',
                        (path, size, mtime, count))
         done += 1
@@ -286,7 +315,7 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
         # Project filter on its own: the most recent thing said in it, which is
         # a useful way in even when you cannot remember any of the words.
         sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
-                        COALESCE(s.summary,''), COALESCE(s.msg_count,0)
+                        COALESCE(s.summary,''), COALESCE(s.msg_count,0), COALESCE(s.ending,'')
                  FROM messages m
                  JOIN sessions s ON s.session = m.session
                  WHERE 1=1'''
@@ -301,14 +330,14 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
             (RECENT_SCAN_ROWS,)).fetchone()
         floor = row[0] if row else ''
         sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
-                        COALESCE(s.summary,''), COALESCE(s.msg_count,0)
+                        COALESCE(s.summary,''), COALESCE(s.msg_count,0), COALESCE(s.ending,'')
                  FROM messages m
                  LEFT JOIN sessions s ON s.session = m.session
                  WHERE m.ts > ? AND m.text LIKE ? ESCAPE '\\' '''
         args = [floor, '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%']
     else:
         sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
-                        COALESCE(s.summary,''), COALESCE(s.msg_count,0)
+                        COALESCE(s.summary,''), COALESCE(s.msg_count,0), COALESCE(s.ending,'')
                  FROM messages_fts f
                  JOIN messages m ON m.id = f.rowid
                  LEFT JOIN sessions s ON s.session = m.session

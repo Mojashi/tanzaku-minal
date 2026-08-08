@@ -33,6 +33,7 @@ Actions::
 """
 
 import os
+import time
 from collections.abc import Generator, Sequence
 from typing import Any
 
@@ -50,6 +51,7 @@ SIDEBAR_VAR = 'strip_sidebar'
 DEFAULT_SIDEBAR_COLUMNS = 44
 MIN_SIDEBAR_COLUMNS = 20
 WIDE_SIDEBAR_COLUMNS = 110  # reading width, for the toggle
+USER_SCROLL_GRACE = 8.0  # seconds the viewport stays where it was put
 
 
 class StripLayoutOpts(LayoutOpts):
@@ -98,7 +100,7 @@ class Strip(Layout):
         # Free scrolling (trackpad) must not fight the focus-follow logic, so we
         # remember that the user is driving the viewport and stop re-centring on
         # the active column until the focus actually changes.
-        self._user_scrolled: bool = False
+        self._user_scrolled_at: float = 0.0
         self._last_active_id: int = -1
         self._scroll_accum: float = 0.0
         # Live override of layout_opts.min_columns, so the floor can be dialled
@@ -126,7 +128,7 @@ class Strip(Layout):
         self._scroll_accum -= step
         before = self.offset
         self.offset = max(0, self.offset + step)
-        self._user_scrolled = True
+        self._user_scrolled_at = time.monotonic()
         # The real clamp needs the column sizes, which _compute_plan has; it
         # runs on the relayout this returns True for.
         return self.offset != before
@@ -197,13 +199,6 @@ class Strip(Layout):
 
         add_timer(later, 0.01, False)
 
-    def _append_sidebar(self, sidebar: WindowGroup | None, view: int) -> None:
-        if sidebar is None:
-            return
-        cells = max(1, (self._sidebar_px - self._decoration(sidebar)) // lgd.cell_width)
-        # Laid out last so it is on top of a column peeking out from under it.
-        self._plan.append((sidebar, cells, view))
-
     def _sync_widths(self, groups: Sequence[WindowGroup], sidebar: WindowGroup | None = None) -> None:
         minc = self.min_columns
         live = {g.id for g in groups}
@@ -244,10 +239,12 @@ class Strip(Layout):
             return
         focus_changed = active.id != self._last_active_id
         self._last_active_id = active.id
-        if self._user_scrolled and not focus_changed:
-            # The user is dragging the viewport; don't yank it back.
+        # Hands off for a while after a scroll. A boolean cleared on the next
+        # layout was not enough: the sidebar redraws constantly, and each of
+        # those layouts dragged the viewport back to the focused column, so
+        # scrolling away from it looked like the whole strip springing back.
+        if not focus_changed and time.monotonic() - self._user_scrolled_at < USER_SCROLL_GRACE:
             return
-        self._user_scrolled = False
         try:
             idx = groups.index(active)
         except ValueError:
@@ -292,14 +289,15 @@ class Strip(Layout):
         # the last scrolling column always has a divider on its right, which is
         # otherwise the one edge in the layout that cannot be grabbed.
         view = lgd.central.width
+        self._sidebar_px = 0
         if sidebar is None:
             self._ensure_sidebar()
         else:
             self._sidebar_spawning = False
-            self._sidebar_px = min(self._width_px(sidebar, self.widths[sidebar.id]), max(0, view // 2))
-            view -= self._sidebar_px
+            # It scrolls with everything else: it is the last column of the
+            # strip, not a panel pinned over it. Only its width is special.
+            groups = groups + [sidebar]
         if not groups:
-            self._append_sidebar(sidebar, view)
             return
 
         sizes = self._sizes(groups)
@@ -322,7 +320,6 @@ class Strip(Layout):
                 assigned += cells
                 self._plan.append((g, cells, x))
                 x += self._width_px(g, cells)
-            self._append_sidebar(sidebar, view)
             return
 
         # Overflowing: scroll the viewport across the strip.
@@ -346,7 +343,6 @@ class Strip(Layout):
             x += size
         self._more_before = self.offset > 0
         self._more_after = self.offset < max_offset
-        self._append_sidebar(sidebar, view)
 
     def update_visibility(self, all_windows: WindowList) -> None:
         self._compute_plan(all_windows)

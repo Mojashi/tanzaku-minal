@@ -46,6 +46,7 @@ GREEN = '\033[38;5;149m'
 BLUE = '\033[38;5;110m'
 GREY = '\033[38;5;244m'
 HIT = '\033[38;5;214m\033[1m'
+RED = '\033[38;5;203m'
 
 
 def clip_right(text: str, width: int) -> str:
@@ -187,7 +188,9 @@ class UI:
 
         qshown = clip_right(self.query, room)
         pshown = clip_right(self.project, room)
-        out.append(f'{DIM}┌{"─" * (inner - 2)}┐{R}')
+        title = ' SESSIONS '
+        rule = '─' * max(0, inner - 2 - len(title))
+        out.append(f'{DIM}┌{R}{AMBER}{title}{R}{DIM}{rule}┐{R}')
         out.append(field('/ ', qshown, self.focus == 0))
         out.append(field('@ ', pshown, self.focus == 1))
         out.append(f'{DIM}└{"─" * (inner - 2)}┘{R}')
@@ -225,8 +228,11 @@ class UI:
             else:
                 out.append(f'  {DIM}(no summary){R}')
             extra = f' ·{hit.hits} hits' if hit.hits > 1 else ''
+            # How it stopped, when that is worth knowing: a session cut off by a
+            # crash or a connection failure is one you probably meant to finish.
+            mark = {'error': f'{RED}⚡cut off{R}', 'cut': f'{AMBER}⚠ unanswered{R}'}.get(hit.ending, '')
             meta = f'{hit.ts[:10]} {hit.ts[11:16]} · {hit.msg_count} msgs{extra}'
-            out.append(f'  {DIM}{fit(meta, inner - 2)}{R}')
+            out.append(f'  {DIM}{fit(meta, inner - 2)}{R}' + (f' {mark}' if mark else ''))
             out.append(f'  {DIM}{snippet(hit.text, self.query, inner - 3)}{R}')
             shown_rows += per
 
@@ -410,8 +416,24 @@ class UI:
         self.dirty = True
 
 
+#: The sidebar is not a terminal you work in, and it should not look like one.
+#: It paints itself rather than being styled by the layout, because a window can
+#: only be told its own colours from inside it.
+SIDEBAR_BG = '#15171c'
+SIDEBAR_FG = '#c8ccd4'
+
+
+def paint_self() -> None:
+    sys.stdout.write(f'\033]11;{SIDEBAR_BG}\007\033]10;{SIDEBAR_FG}\007')
+    # No cursor block in a list, but the cursor still has to exist and stay in
+    # the search box for the IME candidate window to have somewhere to go.
+    sys.stdout.write('\033[6 q')
+    sys.stdout.flush()
+
+
 def main() -> None:
     ui = UI()
+    paint_self()
     m, s = stats()
     ui.status = f'{m} messages · {s} sessions'
 
