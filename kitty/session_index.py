@@ -32,6 +32,8 @@ DB_PATH = os.path.expanduser('~/.cache/kitty-session-search/index.db')
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS files (
+    -- msg_count is the line to resume from, not a count of messages. It was
+    -- both once, which is how the index filled up with duplicates.
     path TEXT PRIMARY KEY, size INTEGER, mtime REAL, msg_count INTEGER
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -152,8 +154,8 @@ def flatten(content: Any) -> str:
     return str(content)
 
 
-def claude_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str, str, bool]]:
-    """(role, ts, text, cwd, is_error) for a Claude Code session file."""
+def claude_messages(path: str, start_line: int) -> Iterator[tuple[int, str, str, str, str, bool]]:
+    """(line, role, ts, text, cwd, is_error) for a Claude Code session file."""
     with open(path, encoding='utf-8', errors='replace') as f:
         for i, line in enumerate(f):
             if i < start_line or not line.strip():
@@ -172,12 +174,12 @@ def claude_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str,
             if text:
                 # Claude marks these itself, so a session that died on a
                 # connection failure is a fact rather than a guess.
-                yield (role, d.get('timestamp') or '', text[:MAX_TEXT], d.get('cwd') or '',
+                yield (i, role, d.get('timestamp') or '', text[:MAX_TEXT], d.get('cwd') or '',
                        bool(d.get('isApiErrorMessage')))
 
 
-def codex_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str, str, bool]]:
-    """(role, ts, text, cwd) for a Codex rollout file, old and new layouts."""
+def codex_messages(path: str, start_line: int) -> Iterator[tuple[int, str, str, str, str, bool]]:
+    """(line, role, ts, text, cwd, is_error) for a Codex rollout file, old and new layouts."""
     cwd = ''
     with open(path, encoding='utf-8', errors='replace') as f:
         for i, line in enumerate(f):
@@ -201,7 +203,7 @@ def codex_messages(path: str, start_line: int) -> Iterator[tuple[str, str, str, 
                 continue
             text = flatten(payload.get('content'))
             if text:
-                yield (role, d.get('timestamp') or payload.get('timestamp') or '',
+                yield (i, role, d.get('timestamp') or payload.get('timestamp') or '',
                        text[:MAX_TEXT], cwd, False)
 
 
@@ -254,16 +256,21 @@ def update(progress: bool = False, budget: float = 0.0) -> tuple[int, int]:
         try:
             last_role = last_text = ''
             last_error = False
-            for n, (role, ts, text, c, err) in enumerate(reader(path, start_line)):
+            # Where to pick up next time, in lines. Counting messages instead
+            # made this smaller than the number of lines actually consumed --
+            # not every line is a message -- so each pass re-read the tail of
+            # the last one and inserted it again. 37% of the index was copies.
+            next_line = start_line
+            for line, role, ts, text, c, err in reader(path, start_line):
                 cwd = c or cwd
                 last_role, last_text, last_error = role, text, err
+                next_line = line + 1
                 if ts:
                     first_ts = first_ts or ts
                     last_ts = ts
                 rows.append((session, source, role, ts, text))
         except OSError:
             continue
-        count = start_line + len(rows)
         with db:
             if rows:
                 db.executemany(
@@ -287,12 +294,12 @@ def update(progress: bool = False, budget: float = 0.0) -> tuple[int, int]:
                    ON CONFLICT(session) DO UPDATE SET
                      cwd=COALESCE(NULLIF(excluded.cwd,''), sessions.cwd),
                      last_ts=COALESCE(NULLIF(excluded.last_ts,''), sessions.last_ts),
-                     msg_count=excluded.msg_count,
+                     msg_count=COALESCE(sessions.msg_count,0) + excluded.msg_count,
                      summary=COALESCE(NULLIF(sessions.summary,''), excluded.summary),
                      ending=excluded.ending''',
-                (session, source, cwd, path, first_ts, last_ts, count, summary, ending))
+                (session, source, cwd, path, first_ts, last_ts, len(rows), summary, ending))
             db.execute('INSERT OR REPLACE INTO files(path, size, mtime, msg_count) VALUES (?,?,?,?)',
-                       (path, size, mtime, count))
+                       (path, size, mtime, next_line))
         done += 1
         if progress and done % 500 == 0:
             print(f'{done}/{len(todo)}', file=sys.stderr, flush=True)
@@ -469,9 +476,32 @@ def stats() -> tuple[int, int]:
     return m, s
 
 
+def dedupe(progress: bool = False) -> int:
+    """Drop the copies an older resume offset left behind.
+
+    Only exact (session, ts, text) triples, which are the same record read
+    twice rather than anything said twice. Deleting through the table fires the
+    FTS delete trigger, so the trigram index shrinks with it.
+    """
+    db = connect()
+    n = db.execute('SELECT count(*) FROM messages').fetchone()[0]
+    if progress:
+        print(f'{n} rows, deduping…', file=sys.stderr, flush=True)
+    with db:
+        db.execute('''DELETE FROM messages WHERE id NOT IN (
+                        SELECT min(id) FROM messages GROUP BY session, ts, text)''')
+    left = db.execute('SELECT count(*) FROM messages').fetchone()[0]
+    db.close()
+    return n - left
+
+
 def main() -> None:
     args = sys.argv[1:]
-    if '--update' in args:
+    if '--dedupe' in args:
+        gone = dedupe(progress=True)
+        m, s = stats()
+        print(f'removed {gone} duplicate rows; {m} messages in {s} sessions')
+    elif '--update' in args:
         done, left = update(progress=True)
         m, s = stats()
         print(f'indexed {done} files, {left} left; {m} messages in {s} sessions')
