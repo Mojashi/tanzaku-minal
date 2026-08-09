@@ -350,9 +350,14 @@ class Strip(Layout):
         active_window = all_windows.active_window
         for window, is_group_leader in all_windows.iter_windows_with_visibility():
             wg = all_windows.group_for_window(window)
-            is_visible = window is active_window or (
-                is_group_leader and wg is not None and wg.id in shown)
-            window.set_visible_in_layout(is_visible)
+            # Being focused is not enough to be on screen here. The usual rule
+            # keeps the active window visible unconditionally, which in a layout
+            # you can scroll away from left it drawn at whatever geometry it had
+            # when it was last placed -- a sliver of it stuck to the edge of the
+            # screen. A column is visible if the strip currently reaches it.
+            in_plan = wg is not None and wg.id in shown
+            window.set_visible_in_layout(
+                in_plan and (is_group_leader or window is active_window))
 
     def do_layout(self, windows: WindowList) -> None:
         if not self._plan:
