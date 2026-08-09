@@ -2961,22 +2961,24 @@ class Boss:
         Does nothing when the selection is not the path of an existing file, so it is
         safe to trigger on every selection with :opt:`preview_on_select`.
         ''')
-    def preview_selection(self) -> None:
+    def preview_selection(self, path: str = '') -> None:
         from .constants import kitten_exe
         from .file_preview import command_for, resolve
         w = self.active_window
         if w is None or w.destroyed:
             return
-        text = w.text_for_selection()
+        text = path or w.text_for_selection()
         if not text:
             return
         preview = resolve(text, w.cwd_of_child)
         if preview is None:
             return
-        # An overlay keeps the column's own geometry, which matters in layouts
-        # where windows are not interchangeable.
+        # Not an overlay: the graphics protocol places images against the
+        # window they were sent to, and an overlay is not that window, so an
+        # image preview came out blank. A column of its own also gives a big
+        # image somewhere to be.
         self.launch(
-            '--type=overlay', '--cwd', os.path.dirname(preview.path),
+            '--location', 'after', '--cwd', os.path.dirname(preview.path),
             '--title', os.path.basename(preview.path),
             *command_for(preview, kitten_exe()))
 

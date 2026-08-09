@@ -98,6 +98,7 @@ class InvalidMods(ValueError):
     'goto_session',
     'save_as_session',
     'close_session',
+    'preview_selection',
 )
 def shlex_parse(func: str, rest: str) -> FuncArgsType:
     return func, to_cmdline(rest)
