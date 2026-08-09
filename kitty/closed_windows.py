@@ -32,6 +32,26 @@ class ClosedWindow(NamedTuple):
     title: str
 
 
+def tmux_relaunch(argv: tuple[str, ...]) -> list[str]:
+    """Re-attach to the session rather than trying to create it again.
+
+    A tmux session outlives the window that was showing it: closing the window
+    only detached it. Replaying the recorded ``new-session`` would therefore
+    fail with "duplicate session" and the new window would die on the spot,
+    which looks exactly like the reopen doing nothing. ``-A`` means attach if it
+    exists, create otherwise, so the same line covers both.
+    """
+    out = list(argv)
+    for verb in ('new-session', 'new'):
+        if verb in out:
+            i = out.index(verb)
+            rest = out[i + 1:]
+            if '-A' not in rest and any(a == '-s' or a.startswith('-s') for a in rest):
+                out.insert(i + 1, '-A')
+            return out
+    return out
+
+
 def relaunch_argv(argv: tuple[str, ...]) -> list[str]:
     """Turn a recorded command line into arguments for launch.
 
@@ -43,6 +63,8 @@ def relaunch_argv(argv: tuple[str, ...]) -> list[str]:
     exe = os.path.basename(argv[0])
     if exe in SHELL_NAMES or exe.startswith('-'):  # login shells come through as -zsh
         return []
+    if exe == 'tmux':
+        return tmux_relaunch(argv)
     resume = RESUMABLE.get(exe)
     if resume is not None:
         flag, already = resume

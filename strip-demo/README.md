@@ -1,98 +1,226 @@
-# strip layout
+# kitty strip layout — 短冊スクロールのプロトタイプ
 
-A scrollable-strip layout for kitty. Every other layout divides the available
-space among the windows, so the more you open the narrower each one gets. This
-one inverts that: each column has an **absolute** width with a floor of
-`min_columns` cells, and once the columns no longer fit you **scroll the strip
-instead of shrinking them**.
+各ペインに最小幅（桁数）の床を設け、収まらなくなったら**縮めずに横スクロール**する
+kitty のレイアウト。scrollable-tiling WM（niri / PaperWM）と同じく、第一級の単位は
+タイルではなく**カラム**で、カラムは ratio ではなく**絶対幅（セル数）**を持つ。
 
-The model comes from scrollable-tiling window managers (niri, PaperWM), where
-the first class unit is the column rather than the tile. No terminal seems to
-do it — the idea lives in window managers and in note taking apps (Obsidian's
-"Sliding Panes"), but not in a terminal's own split system. On macOS there is no
-good scrolling WM to lean on, which is exactly where it is missing.
+スクロール位置はカラム番号ではなく**ピクセルオフセット**なので、左右の端に見切れた
+カラムが出る。kitty はビューポート外にはみ出したウィンドウをクリップして描画するので、
+その見切れが「まだ続く」のアフォーダンスになる。
 
-![icon](icon/preview.png)
+## 中身
 
-## Use
-
-```conf
-enabled_layouts strip:min_columns=80
-```
-
-`min_columns=0` removes the floor, which gives you back the behaviour of the
-built in `horizontal` layout.
-
-The scroll position is a pixel offset rather than a column index, so columns at
-either edge are partially visible. kitty already clips a window whose geometry
-falls outside the viewport, and that clipped sliver is the affordance: it is
-what tells you the strip continues.
-
-**The floor does nothing while everything fits.** If the columns add up to less
-than the screen they are stretched to fill it, like any other layout. The floor
-only starts to matter once the strip overflows.
-
-## Actions
-
-```conf
-map cmd+shift+left   layout_action scroll -1      # one column, snaps
-map cmd+shift+right  layout_action scroll 1
-map cmd+ctrl+equal   layout_action equalize       # even out, keep total width
-map cmd+shift+period layout_action resize_all 10  # every column +10 cells
-map cmd+shift+comma  layout_action resize_all -10
-map cmd+shift+0      layout_action fit            # squeeze back into the screen
-map cmd+shift+minus  layout_action min_columns -10
-map cmd+shift+equal  layout_action min_columns +10
-```
-
-`layout_action hscroll <px>` scrolls freely, without snapping to a column.
-
-A horizontal trackpad gesture scrolls the strip, with the OS momentum intact.
-
-Resizing one column leaves every other column's width alone, so the strip as a
-whole grows or shrinks by the same amount — both by dragging a divider and via
-`resize_window wider|narrower`.
-
-## Changes outside the layout
-
-- **`Layout.relayout_on_focus_change`** — `Tab.active_window_changed()` only
-  refreshes visibility, which is enough for the stack layout but not for one
-  whose geometry depends on which window is active. Without it the viewport
-  cannot follow the focus.
-
-- **`Layout.wants_horizontal_scroll` / `horizontal_scroll()`**, wired up in
-  `mouse.c`. It is handled *before* the momentum gate: that gate drops momentum
-  events whose window differs from the one the gesture started on, and scrolling
-  a strip slides a different column under a stationary pointer, so the glide
-  would otherwise die the moment a column boundary crossed the cursor. Gesture
-  level axis locking keeps vertical scrolling untouched, and layouts that do not
-  want the event fall through to the existing path.
-
-- **`Strip.drag_resize_target_windows`** — kitty draws two coincident borders
-  between adjacent windows, so which one a click lands on is luck, and the same
-  drag would sometimes widen the left column and sometimes shrink the right one,
-  silently doing nothing when the right one was already at the floor. A divider
-  now always belongs to the column on its left.
-
-Scrolling never resizes a pty: `Window.set_geometry` skips `screen.resize` when
-the cell count is unchanged, and the columns only move, so no `SIGWINCH` is sent
-however far you scroll.
-
-## Files here
-
-| | |
+| ファイル | 説明 |
 |---|---|
-| `kitty.conf` | a config using the layout, styled after Ghostty (Smyck theme, JetBrains Mono, Ghostty's split keybindings) |
-| `icon/strip.svg` | app icon: fixed width columns, the rightmost cut off by the edge |
-| `icon/apply-icon.sh` | renders the SVG into the launcher bundle (macOS) |
+| `strip-layout.patch` | 変更一式（既存 5 ファイルへの +117 行 + 新規 `kitty/layout/strip.py`） |
+| `icon/` | アプリアイコン。`strip.svg` が原本、`apply-icon.sh` で SVG→icns→バンドル適用まで一気に走る |
+| `kitty.conf` | 普段の Ghostty に寄せた設定（テーマ・フォント・シェル・キーバインド） |
+| `shots/` | 実機スクリーンショット |
+| `banner.sh` | 各ペインに幅を表示させるスクリプト（デモ用） |
+| `com.apple.dock.plist.backup` | Dock 登録前のバックアップ |
 
-The config needs `brew install --cask font-jetbrains-mono` for the font, and
-assumes `/bin/zsh`.
+コードの本体は clone 側: `~/repos/kitty/kitty/layout/strip.py`
 
-## Known rough edges
+## 起動
 
-- No vertical splits inside a column. A strip is a list of columns, not a tree;
-  supporting them means pulling in the `splits` layout's tree.
-- `resize_window` overshoots by a few percent, because the increment makes a
-  round trip through cells → bias → cells.
-- `layout_state` only persists the scroll offset, not the column widths.
+```sh
+~/repos/kitty/kitty/launcher/kitty --config ~/repos/kitty-strip-demo/kitty.conf
+```
+
+Python だけの変更なら再ビルド不要。kitty を再起動するだけで反映される。
+初回ビルドが必要なら `cd ~/repos/kitty && ./dev.sh build`（Xcode 不要、CLT で通る）。
+
+`KITTY_STRIP_DEBUG=1` を付けて起動すると、毎回のレイアウト計算がログに出る。
+
+## キーバインド
+
+Ghostty の split 系をそのまま移植してある。kitty 既定（`ctrl+shift+...`）も残してあるので併用可。
+
+| キー | Ghostty での対応 | 動作 |
+|---|---|---|
+| `cmd+d` | `new_split:right` | 新しいカラムを開く |
+| `cmd+[` / `cmd+]` | `goto_split:previous/next` | フォーカス移動（ビューポートが追従） |
+| `cmd+alt+←` / `→` | `goto_split:left/right` | 左右のカラムへ |
+| `cmd+ctrl+←` / `→` | `resize_split` | **このカラムだけ**を伸縮（＝短冊全体が伸縮） |
+| `cmd+ctrl+=` | `equalize_splits` | 幅を全部合わせる（合計は維持） |
+| `cmd+shift+enter` | `toggle_split_zoom` | ズーム（`toggle_layout stack`） |
+| `cmd+w` | `close_surface` | カラムを閉じる |
+| `cmd+t` | （対応物なし） | 閉じたカラムを開き直す |
+| `cmd+n` / `cmd+shift+n` | （対応物なし） | 新しいタブ / 新しい OS ウィンドウ |
+| `cmd+ctrl+shift+n` | （対応物なし） | 行き先を選んでカラムを切り出す |
+| `cmd+alt+w` | `close_tab:this` | タブを閉じる |
+| `cmd+shift+w` | `close_window` | OS ウィンドウごと閉じる |
+| `shift+enter` | `text:\n` | 改行送出 |
+
+kitty 既定の `ctrl+shift+w` でもカラムを閉じられる。
+
+**`cmd+shift+d` は潰してある。** kitty 既定では `close_window`（ペインを閉じる）だが、
+Ghostty では `new_split:down` なので、縦分割のつもりで押してペインが消える事故が起きる。
+`map cmd+shift+d no_op` で無効化した（同一トリガに複数定義があるとき kitty は
+最後のものを使う ―― `keys.py` の `matches = [matches[-1]]`）。
+
+**`cmd+shift+t` も同じ理由で潰してある。** かつて `detach_window new-tab` を当てていたが、
+真隣の `cmd+t`（閉じたカラムの復元）と押し間違えると、そのカラムだけ新しいタブへ移り
+**短冊が丸ごと消えたように見える**（短冊もサイドバーもタブ単位なので、移った先には
+何も無いように見える）。切り出しの入口は行き先を訊く `cmd+ctrl+shift+n` 1 つにした。
+
+短冊固有（Ghostty に対応物が無いもの）:
+
+| 操作 | 動作 |
+|---|---|
+| **トラックパッドの横スクロール** | **ぬるぬる自由スクロール**（ピクセル単位・慣性つき） |
+| `cmd+shift+←` / `→` | 短冊を 1 カラムぶん送る（境界に吸着） |
+| `cmd+shift+.` / `,` | 全部の幅を等しく ±10 桁 |
+| `cmd+shift+0` | 全部を画面に収める |
+| `cmd+shift+-` / `=` | **最小幅を ±10 桁**（全カラムが新しい最小幅に揃う） |
+
+**最小幅は画面に収まっている間は効かない。** 全カラムの合計が画面幅以下なら、
+他のレイアウトと同じように引き伸ばして画面を埋める。最小幅が意味を持つのは
+溢れてスクロールが始まってから。ペインが 2〜3 枚のうちは `min_columns` を
+変えても見た目が変わらないのはこのため。
+
+トラックパッドの横スクロールは `kitty/mouse.c` の `scroll_event` に手を入れて実装した。
+高解像度スクロール（`GLFW_SCROLL_OFFEST_HIGHRES`）をそのまま使うので、macOS の慣性が効く。
+
+**マウストラッキング中でも横取りする。** Claude Code や vim のような全画面 TUI は
+マウストラッキングを有効にするので、「トラッキング中は素通し」にすると
+一番使いたい場面で短冊が動かせなくなる。短冊レイアウトでは OS ウィンドウ自体が
+スクロール可能なビューポートなので、横スクロールはビューポートのものとして扱う。
+
+**慣性は OS のものをそのまま使う。** macOS は指を離した後も減衰する momentum フェーズの
+スクロールイベントを送り続けるので、それを落とさなければ慣性はタダで手に入る。ただし
+`scroll_event` にはジェスチャー開始時と別ウィンドウの momentum イベントを捨てる関門があり、
+**短冊はスクロールするとカーソルの下を別のカラムが通過する**ため、そのままだと
+カラム境界がカーソルを跨いだ瞬間に滑りが止まる。横スクロールの横取りを
+この関門より**手前**に置くことで、momentum フェーズが素通りするようにしてある。
+
+奪いすぎないための歯止めが 2 つ:
+
+- **軸ロック（ジェスチャー単位）**: ジェスチャー開始時に優勢だった軸が、そのジェスチャーの
+  最後まで所有権を持つ。イベント単位の判定では不十分で、縦スクロールの横揺れが
+  ときどき x 優勢のイベントを生み、それを横取りしてしまうと**縦スクロールが
+  入力を取りこぼしているように感じる**。200ms スクロールが途切れるか
+  momentum が終了したらロックを解除する
+- **レイアウトが要求したときだけ**: `Layout.wants_horizontal_scroll` が False なら
+  C 側は従来どおり（トラッキング中はボタン 6/7 としてプログラムに転送）に落ちる。
+  そのために `call_boss` ではなく戻り値を見る専用の呼び出しを書いてある
+
+キーからも自由スクロールを叩ける: `layout_action hscroll <px>`
+
+## 設定
+
+```conf
+enabled_layouts strip:min_columns=40
+```
+
+`min_columns=0` にすると床が無くなり、既存の horizontal レイアウトと同じ挙動に戻る。
+
+Ghostty 側から移植した見た目: Smyck テーマ（palette 16色 + 背景/前景/選択色）、
+`background_opacity 0.8`、`font_size 13`、cell width/height 調整、
+window padding 2、`term=xterm-256color`、`shell /bin/zsh`。
+
+**フォント**は Ghostty と同じ JetBrains Mono。Ghostty はこれをバイナリに同梱していて
+システムには入らないので、別途入れてある:
+
+```sh
+brew install --cask font-jetbrains-mono
+```
+
+Ghostty の字面に寄せるための調整:
+
+- `modify_font cell_height 2px` — ghostty の `adjust-cell-height = 2` 相当
+- `adjust-cell-width = -1` は**移植していない**。Ghostty はセルを詰めたうえでグリフを
+  中央に置き直すが、kitty の `modify_font cell_width` はセルを狭めるだけなので
+  字間が詰まって不揃いに見える
+- `text_composition_strategy 1.7 45` — ghostty の `font-thicken` 相当。kitty の macOS 既定
+  （gamma 1.7 / contrast 30）は暗背景で細く見えるので、2 つ目の数字だけ上げてある
+
+## 検証済みの挙動
+
+- 複数ペインが全て `min_columns` を維持し、溢れた分が左右にスクロールアウトする
+- 端の見切れカラムを kitty がクリップして描画する（左端の負座標も含む）
+- 右端まで送っても死に領域が出ない（オフセットが `total - viewport` でクランプされる）
+- 1 カラムだけ広げると、その列だけが変わり他は絶対幅を維持したまま全体が伸びる
+- `equalize` は合計幅を保ったまま均す（例: 90/90/90/133/90/90 → 全部 97）
+- フォーカス移動でビューポートが追従する
+- カラム位置がピクセル単位で自由に動く（オフセット 7171 → 7240 のように境界に吸着しない）
+- **スクロール中に PTY リサイズが起きない**。`Window.set_geometry` はセル数が変わらなければ
+  `screen.resize` を呼ばず、`current_pty_size` にも変化が無いので `resize_child` も走らない。
+  カラムの幅は変えずに位置だけずらす設計なので、何度スクロールしてもシェルに SIGWINCH が飛ばない
+- 各カラムの上にタイトル帯が出る（`window_title_bar_min_windows 1`）
+- kitty の Python テスト 195 件全通過（Go テストは変更前のクリーンなツリーでも同じく失敗＝既存の環境起因）
+
+## 境界線の所有権
+
+kitty は隣り合うウィンドウの間に**同じ位置の線を 2 本**描く。左のカラムの右端の線と、
+右のカラムの左端の線で、`vertical.py` の `borders()` が各ウィンドウについて
+`e1`（左端, `window_id` が負）と `e2`（右端, 正）を積んでいる。
+
+既定の `drag_resize_target_windows` は「クリックが当たったウィンドウ」を対象にするので、
+**同じ見た目の線をドラッグしても、どちらの線に当たったかで挙動が変わる**。
+右カラムの左端に当たると右カラムを縮める方向になり、そのカラムが既に `min_columns` なら
+`apply_bias` がクランプして False を返す ―― つまり**何も起きない**。
+「境界線をドラッグしてもサイズを変えられないことがある」の正体はこれ。
+
+`Strip.drag_resize_target_windows` で正規化した: 左端を掴んだ場合は**前のカラムの右端**に
+読み替える。これで **境界線は常に左のカラムの持ち物**になり、ドラッグすると必ず
+左のカラムが伸縮して短冊全体が伸び縮みする。
+
+線が 1pt しかないので `window_drag_tolerance` も 2 → 8 に上げてある。
+
+その裏返しとして、**一番右のカラムには右側に境界線が無い**ので広げられなくなる。
+kitty 既定の `borders()` は外周の線を落とすので、右端の線がそもそも描かれていなかった。
+`end_offset=0` にして**右端の線は常に描く**ようにしてある。短冊を右端までスクロールすれば
+その線が最後のカラムの右端に来るので掴んで広げられる。
+
+ただし短冊が右に溢れている間は最後のカラムの右端は画面外にあり、掴みようがない。
+その場合は `cmd+ctrl+→`（`resize_window wider`）を使う ―― こちらは境界線ではなく
+**フォーカス中のカラム**を対象にするので、どのカラムでもスクロール位置に関係なく効く。
+
+## サイドバー（SESSIONS）
+
+`enabled_layouts strip:sidebar=yes` で、短冊の**最後のカラム**として常駐する
+（`kitty/strip_sidebar.py`）。パネルではなくカラムなので、左へスクロールすれば視界から外れる。
+
+**検索窓が空のときは tmux で走っている会話の一覧**、何か打つと全会話の全文検索になる。
+`/` が全文、`@` がプロジェクト（cwd）で、Tab で行き来する。分けてあるのは
+「言葉を探す」と「場所で絞る」が別の問いだから ―― 1 つの窓に混ぜると両者を
+見分ける構文を発明する羽目になる。
+
+- **ongoing の正は tmux で、インデックスではない。** 1 分前に始まった会話はまだ
+  索引されていないし、`c` が会話 ID を tmux セッション名に焼く前に作られたものは
+  引くべき ID を持たない。見出しに `#{pane_title}` を使うのも同じ理由で、
+  エージェントが更新し続けるので「最初に何を頼まれたか」ではなく**今何をしているか**が出る
+- `○` = detach（誰も見ていないが走っている）、`●` = attach 済み。**detach を先に並べる**。
+  この一覧の存在意義は、画面のどこにも出ていない会話に手を伸ばすことなので
+- Enter で開く。**すでに attach 済みなら、二重に attach せずそのカラムにフォーカスを移す**
+  ―― tmux はセッションのサイズを最小のクライアントに合わせるので、
+  2 つ目の attach は今使っている方を縮めてしまう
+- 一覧は 2 秒ごとに更新するが、**中身が変わったときだけ描き直す**。
+  無条件の再描画は IME の変換候補（＝検索窓のカーソル位置に出る）と喧嘩する
+
+`cmd+shift+s` で出し入れ、`cmd+shift+\` で読む用の幅と元の幅をトグルする。
+
+## 閉じたカラムを開き直す（`cmd+t`）
+
+`reopen_closed_window`（`kitty/closed_windows.py`）。ターミナルは閉じたウィンドウを
+本当の意味では復元できない ―― 閉じた時点でプロセスは死んでいる。復元できるのは
+**どこにいて何を走らせていたか**で、自分の状態をディスクに持つプログラムは
+それを拾い直させれば十分近いところまで戻る。
+
+- シェルだけだったカラムはただのシェルとして開き直す
+- `claude` は `--continue` を足して開き直す（既に `-r` / `--session-id` がある場合は足さない）
+- **`tmux new-session -s X …` は `-A` を足して開き直す。** tmux セッションはウィンドウより
+  長生きで、閉じたのは client だけ（セッションは detach になっただけ）。記録した
+  コマンドをそのまま再実行すると `duplicate session` で即死し、**復元が何も起きていない
+  ように見える**。`-A` は「あれば attach、無ければ作る」なので両方を 1 行で賄える
+
+## 移植していないもの・既知の粗さ
+
+- **`super+shift+d`（`new_split:down`）に対応物が無い。** strip はカラムの列であって
+  木ではないので、カラム内の縦分割を持たない。入れるなら kitty の `splits` レイアウトの
+  ツリーを取り込む必要があり、規模が別物になる
+- `resize_window` の増分がセル→bias→セルの往復で数%上振れする（+10 のつもりが +13）
+- `layout_state` はスクロール位置しか保存せず、カラム幅がセッション復元されない
+- Ghostty の `font-feature=-dlig` / `font-thicken` / `alpha-blending=linear` /
+  `shell-integration-features=sudo` は kitty に対応物が無いか実質誤差なので落とした

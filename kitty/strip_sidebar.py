@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # License: GPLv3 Copyright: 2026, strip layout prototype
 
-"""Full text search over Claude Code and Codex sessions, for the docked sidebar.
+"""Claude Code and Codex sessions, live and past, for the docked sidebar.
 
-A search box at the top and results below. Picking one opens it in a new column
-rather than in here, so the search stays where it is.
+A search box at the top and results below. With the box empty the list is the
+conversations still running in tmux, because those are the ones you can lose
+track of; type and it becomes a full text search over everything ever said.
+Picking one opens it in a new column rather than in here, so the search stays
+where it is.
 
 Deliberately not fzf: the sidebar is a narrow column, and fzf's single line of
 results with a preview pane to the right needs width this does not have. Here
@@ -16,6 +19,7 @@ Started for you by the layout when it is enabled with::
     enabled_layouts strip:sidebar=yes
 """
 
+import json
 import os
 import re
 import unicodedata
@@ -29,13 +33,14 @@ import termios
 import threading
 import time
 import tty
-from typing import Any
+from typing import Any, NamedTuple
 
 from kitty.constants import kitten_exe
 from kitty.session_index import Hit, search, stats, update
 
 DEBOUNCE = 0.18
 MIN_QUERY = 2
+LIVE_POLL = 2.0
 
 R = '\033[0m'
 DIM = '\033[2m'
@@ -71,6 +76,90 @@ def tmux_has(session: str) -> bool:
             capture_output=True, timeout=3).returncode == 0
     except Exception:
         return False
+
+
+class Live(NamedTuple):
+    """A conversation still running in tmux."""
+    name: str
+    attached: bool
+    activity: int
+    windows: int
+    path: str
+    title: str
+
+    @property
+    def source(self) -> str:
+        return 'codex' if self.name.startswith('codex') else 'claude'
+
+
+#: The title comes last so that a separator inside it cannot shift the fields.
+LIVE_FORMAT = '#{session_name}|#{session_attached}|#{session_activity}|#{session_windows}|#{session_path}|#{pane_title}'
+
+
+def live_sessions() -> list[Live]:
+    """What tmux is running right now.
+
+    tmux is the authority on this, not the index: a session that started a
+    minute ago may not be indexed yet, and the ones named before c pinned the
+    conversation id carry no id to look up at all. The pane title is the
+    headline for the same reason -- the agent keeps it current, so it says what
+    the conversation is doing now rather than what it was first asked.
+    """
+    try:
+        out = subprocess.run(['tmux', 'list-sessions', '-F', LIVE_FORMAT],
+                             capture_output=True, timeout=5, text=True)
+    except Exception:
+        return []
+    if out.returncode:  # no server running is the usual reason
+        return []
+    items = []
+    for line in out.stdout.splitlines():
+        parts = line.split('|', 5)
+        if len(parts) < 6:
+            continue
+        name, attached, activity, windows, path, title = parts
+        try:
+            items.append(Live(name, attached == '1', int(activity), int(windows), path, title))
+        except ValueError:
+            continue
+    return items
+
+
+def ago(when: int) -> str:
+    d = max(0, int(time.time()) - when)
+    if d < 60:
+        return f'{d}s'
+    if d < 3600:
+        return f'{d // 60}m'
+    if d < 86400:
+        return f'{d // 3600}h'
+    return f'{d // 86400}d'
+
+
+def focus_window_running(session: str) -> bool:
+    """Bring the column already attached to this session into view.
+
+    Attaching twice would work, but tmux sizes a session to its smallest client,
+    so the second attach shrinks the one you were already using.
+    """
+    try:
+        out = subprocess.run([kitten_exe(), '@', 'ls'], capture_output=True, timeout=5)
+        data = json.loads(out.stdout or b'[]')
+    except Exception:
+        return False
+    for os_window in data:
+        for tab in os_window.get('tabs', []):
+            for w in tab.get('windows', []):
+                for proc in w.get('foreground_processes', []):
+                    if session in ' '.join(proc.get('cmdline') or []):
+                        try:
+                            subprocess.run(
+                                [kitten_exe(), '@', 'focus-window', '--match', f'id:{w["id"]}'],
+                                capture_output=True, timeout=5)
+                        except Exception:
+                            return False
+                        return True
+    return False
 
 
 def kill_word(text: str) -> str:
@@ -153,6 +242,7 @@ class UI:
         self.project = ''
         self.focus = 0  # 0 = query, 1 = project
         self.hits: list[Hit] = []
+        self.live: list[Live] = []
         self.sel = 0
         self.top = 0
         self.status = ''
@@ -168,6 +258,59 @@ class UI:
         self.searching = False
         self.alive = True
         self.size = shutil.get_terminal_size((30, 40))
+
+    # MARK: rows
+
+    def visible_live(self) -> list[Live]:
+        """Ongoing sessions, unless a query has turned this into a search."""
+        if len(self.query) >= MIN_QUERY:
+            return []
+        p = self.project.strip().lower()
+        items = [x for x in self.live if not p or p in x.path.lower()]
+        # Detached first: the point of this list is to reach the conversations
+        # that are not already on screen somewhere.
+        items.sort(key=lambda x: (x.attached, -x.activity))
+        return items
+
+    def cards(self, inner: int) -> list[list[str]]:
+        """Every row as the lines it occupies, live ones then search results."""
+        out: list[list[str]] = []
+        live = self.visible_live()
+        for i, x in enumerate(live):
+            out.append(self.live_card(x, i == self.sel, inner))
+        for j, hit in enumerate(self.hits):
+            out.append(self.hit_card(hit, len(live) + j == self.sel, inner))
+        return out
+
+    def live_card(self, x: Live, cur: bool, inner: int) -> list[str]:
+        bar = f'{AMBER}▍{R}' if cur else ' '
+        # Attached means it is open in a column right now; detached means it is
+        # running with nobody watching it.
+        mark = f'{GREEN}●{R}' if x.attached else f'{AMBER}○{R}'
+        tag = f'{BLUE}cx{R}' if x.source == 'codex' else f'{GREEN}cc{R}'
+        title = x.title.strip() or x.name
+        head = f'{BOLD if cur else ""}{fit(title, inner - 4)}{R}'
+        meta = f'{fit(home_relative(x.path), inner - 18)} · {ago(x.activity)} · {x.name}'
+        return [f'{bar}{mark} {head}', f'  {DIM}{tag} {fit(meta, inner - 6)}{R}']
+
+    def hit_card(self, hit: Hit, cur: bool, inner: int) -> list[str]:
+        bar = f'{AMBER}▍{R}' if cur else ' '
+        tag = f'{BLUE}cx{R}' if hit.source == 'codex' else f'{GREEN}cc{R}'
+        head = f'{BOLD if cur else ""}{fit(home_relative(hit.cwd) or "?", inner - 8)}{R}'
+        # What the conversation was for, which the matching line on its own
+        # rarely says. Without it every result is a fragment out of context.
+        summary = fit(hit.summary, inner - 2) if hit.summary else f'{DIM}(no summary){R}'
+        extra = f' ·{hit.hits} hits' if hit.hits > 1 else ''
+        # How it stopped, when that is worth knowing: a session cut off by a
+        # crash or a connection failure is one you probably meant to finish.
+        mark = {'error': f'{RED}⚡cut off{R}', 'cut': f'{AMBER}⚠ unanswered{R}'}.get(hit.ending, '')
+        meta = f'{hit.ts[:10]} {hit.ts[11:16]} · {hit.msg_count} msgs{extra}'
+        return [
+            f'{bar}{tag} {head}',
+            f'  {summary}',
+            f'  {DIM}{fit(meta, inner - 2)}{R}' + (f' {mark}' if mark else ''),
+            f'  {DIM}{snippet(hit.text, self.query, inner - 3)}{R}',
+        ]
 
     # MARK: drawing
 
@@ -204,39 +347,33 @@ class UI:
         # box off the top, and there is no scrollback worth having here.
         header = 5 + (1 if (self.status or self.searching) else 0)
         rows = max(0, h - header - 1)
-        per = 4
-        capacity = max(1, rows // per)
+        cards = self.cards(inner)
+        n_live = len(self.visible_live())
+
+        # Rows are not all the same height, so the window is pushed down from
+        # the top until the selected row fits rather than sized by a fixed
+        # number of rows per screen.
+        self.top = max(0, min(self.top, len(cards) - 1))
         if self.sel < self.top:
             self.top = self.sel
-        elif self.sel >= self.top + capacity:
-            self.top = self.sel - capacity + 1
+        while self.top < self.sel and sum(len(c) + 1 for c in cards[self.top:self.sel + 1]) > rows:
+            self.top += 1
 
-        shown_rows = 0
-        for i in range(self.top, min(len(self.hits), self.top + capacity)):
-            if shown_rows + per > rows:
+        shown = 0
+        for i in range(self.top, len(cards)):
+            card = cards[i]
+            if i == n_live and n_live and self.top < n_live:
+                if shown + 1 >= rows:
+                    break
+                out.append(f'{DIM}{"─" * inner}{R}')
+                shown += 1
+            if shown + len(card) > rows:
                 break
-            hit = self.hits[i]
-            cur = i == self.sel
-            bar = f'{AMBER}▍{R}' if cur else ' '
-            tag = f'{BLUE}cx{R}' if hit.source == 'codex' else f'{GREEN}cc{R}'
-            head = f'{BOLD if cur else ""}{fit(home_relative(hit.cwd) or "?", inner - 8)}{R}'
-            out.append(f'{bar}{tag} {head}')
-            # What the conversation was for, which the matching line on its own
-            # rarely says. Without it every result is a fragment out of context.
-            if hit.summary:
-                out.append(f'  {fit(hit.summary, inner - 2)}')
-            else:
-                out.append(f'  {DIM}(no summary){R}')
-            extra = f' ·{hit.hits} hits' if hit.hits > 1 else ''
-            # How it stopped, when that is worth knowing: a session cut off by a
-            # crash or a connection failure is one you probably meant to finish.
-            mark = {'error': f'{RED}⚡cut off{R}', 'cut': f'{AMBER}⚠ unanswered{R}'}.get(hit.ending, '')
-            meta = f'{hit.ts[:10]} {hit.ts[11:16]} · {hit.msg_count} msgs{extra}'
-            out.append(f'  {DIM}{fit(meta, inner - 2)}{R}' + (f' {mark}' if mark else ''))
-            out.append(f'  {DIM}{snippet(hit.text, self.query, inner - 3)}{R}')
-            shown_rows += per
+            out += card
+            out.append('')
+            shown += len(card) + 1
 
-        if not self.hits:
+        if not cards:
             msg = 'type to search' if (len(self.query) < MIN_QUERY and not self.project) else 'no matches'
             out.append(f'{DIM} {msg}{R}')
 
@@ -303,6 +440,21 @@ class UI:
                 self.searching = False
                 self.dirty = True
 
+    def poller(self) -> None:
+        """Keep the ongoing list current without a keystroke to trigger it."""
+        while self.alive:
+            live = live_sessions()
+            with self.wake:
+                # Only a real change redraws: a redraw every couple of seconds
+                # would fight the IME, which lives at the cursor in the box.
+                if live != self.live:
+                    self.live = live
+                    self.dirty = True
+            for _ in range(int(LIVE_POLL * 10)):
+                if not self.alive:
+                    return
+                time.sleep(0.1)
+
     def indexer(self) -> None:
         while self.alive:
             try:
@@ -314,10 +466,18 @@ class UI:
                     return
                 time.sleep(1)
 
+    def total(self) -> int:
+        return len(self.visible_live()) + len(self.hits)
+
     def open_selected(self) -> None:
-        if not self.hits:
+        live = self.visible_live()
+        if self.sel < len(live):
+            threading.Thread(target=self.open_live, args=(live[self.sel],), daemon=True).start()
             return
-        hit = self.hits[self.sel]
+        idx = self.sel - len(live)
+        if idx >= len(self.hits):
+            return
+        hit = self.hits[idx]
         # If the conversation is already live in tmux, go to it rather than
         # starting a second copy of it. c and x name the tmux session after the
         # conversation precisely so this lookup is exact rather than a guess.
@@ -358,6 +518,24 @@ class UI:
             self.status = f'failed: {e}'
         self.dirty = True
 
+    def open_live(self, x: Live) -> None:
+        """Go to an ongoing session. Runs off the input thread: it asks kitty
+        what it has open, which is a round trip."""
+        if x.attached and focus_window_running(x.name):
+            self.status = f'focused {x.name}'
+            self.dirty = True
+            return
+        args = [kitten_exe(), '@', 'launch', '--location', 'before', '--title', x.name]
+        if x.path and os.path.isdir(x.path):
+            args += ['--cwd', x.path]
+        args += ['--', 'tmux', 'attach', '-t', f'={x.name}']
+        try:
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.status = f'attached {x.name}'
+        except Exception as e:
+            self.status = f'failed: {e}'
+        self.dirty = True
+
     # MARK: input
 
     def key(self, data: bytes) -> bool:
@@ -379,7 +557,7 @@ class UI:
             self.sel = max(0, self.sel - 1)
             self.dirty = True
         elif data in (b'\x1b[B', b'\x0e'):  # down, ctrl-n
-            self.sel = min(max(0, len(self.hits) - 1), self.sel + 1)
+            self.sel = min(max(0, self.total() - 1), self.sel + 1)
             self.dirty = True
         elif data == b'\x1b':
             self.set_field('')
@@ -444,6 +622,7 @@ def main() -> None:
     signal.signal(signal.SIGWINCH, on_resize)
     threading.Thread(target=ui.worker, daemon=True).start()
     threading.Thread(target=ui.indexer, daemon=True).start()
+    threading.Thread(target=ui.poller, daemon=True).start()
     fd = sys.stdin.fileno()
     try:
         saved = termios.tcgetattr(fd)
