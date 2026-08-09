@@ -46,7 +46,11 @@ CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_ts DESC);
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY, session TEXT, source TEXT, role TEXT, ts TEXT, text TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session);
+-- Ordered, because every lookup by session wants the latest message in it.
+-- Without the ts half, one session costs a sort of everything it ever said,
+-- and listing a project means paying that three hundred times.
+CREATE INDEX IF NOT EXISTS idx_messages_session_ts ON messages(session, ts DESC);
+DROP INDEX IF EXISTS idx_messages_session;  -- subsumed by the above
 -- id is insertion order, which is the order files happened to be indexed in,
 -- not time. Bounded scans need the real thing.
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts DESC);
@@ -321,6 +325,47 @@ def terms_of(query: str) -> list[str]:
     return [t for t in terms if t]
 
 
+def recent_sessions(db: sqlite3.Connection, cwd: str, source: str, limit: int) -> list[Hit]:
+    """The latest sessions in a project, newest first.
+
+    Asked as "which sessions" rather than "which messages". Walking messages
+    newest first and keeping the ones whose session is in this project means
+    reading the whole corpus whenever the project has not been touched lately:
+    a project last used a month ago took 17s, while today's took 0.3s, for the
+    same question. There are 50k sessions against a million messages, and only
+    one message per session is ever shown.
+    """
+    inner = 'SELECT session, source, cwd, summary, msg_count, ending, last_ts FROM sessions WHERE 1=1'
+    args: list[Any] = []
+    if cwd:
+        inner += ' AND cwd LIKE ?'
+        args.append(f'%{cwd}%')
+    if source:
+        inner += ' AND source = ?'
+        args.append(source)
+    # Filter first, then sort what is left. Sorting by the index and filtering
+    # as it goes has to walk the whole table when the project was last used a
+    # while ago -- the rows it wants are at the far end. 1.4s against 0.04s.
+    sql = f'SELECT * FROM ({inner}) ORDER BY last_ts DESC LIMIT ?'
+    args.append(limit)
+    try:
+        rows = db.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return []
+    out = []
+    for session, src, scwd, summary, msg_count, ending, last_ts in rows:
+        try:
+            latest = db.execute(
+                'SELECT role, ts, text FROM messages WHERE session = ? ORDER BY ts DESC LIMIT 1',
+                (session,)).fetchone()
+        except sqlite3.Error:
+            latest = None
+        role, ts, text = latest if latest else ('', last_ts or '', '')
+        out.append(Hit(session, src or '', scwd or '', role or '', ts or last_ts or '',
+                       text or '', summary or '', msg_count or 0, 1, ending or ''))
+    return out
+
+
 def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> list[Hit]:
     query = query.strip()
     if not query and not cwd:
@@ -340,15 +385,13 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
     indexable = [t for t in terms if len(t) >= 3]
     args: list[Any]
     if not terms:
-        # Project filter on its own: the most recent thing said in it, which is
-        # a useful way in even when you cannot remember any of the words.
-        sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
-                        COALESCE(s.summary,''), COALESCE(s.msg_count,0), COALESCE(s.ending,'')
-                 FROM messages m
-                 JOIN sessions s ON s.session = m.session
-                 WHERE 1=1'''
-        args = []
-    elif not indexable:
+        # Project filter on its own: the most recent sessions in it, which is a
+        # useful way in even when you cannot remember any of the words.
+        try:
+            return recent_sessions(db, cwd, source, limit)
+        finally:
+            db.close()
+    if not indexable:
         # Nothing long enough to look up, so there is no way around reading the
         # text -- bounded to recent history, because a scan of the whole corpus
         # takes tens of seconds and this runs on every keystroke.
