@@ -19,6 +19,7 @@ that is still being written is re-read from where it left off.
 
 import json
 import os
+import shlex
 import sqlite3
 import sys
 import time
@@ -302,6 +303,24 @@ def escape(query: str) -> str:
     return '"' + query.replace('"', '""') + '"'
 
 
+def like_arg(term: str) -> str:
+    return '%' + term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+
+
+def terms_of(query: str) -> list[str]:
+    """The words a query is asking for, all of which have to appear.
+
+    Quotes keep a phrase together, for the times when the space is the point.
+    Shared with the caller that highlights the results, so what is marked is
+    exactly what was matched.
+    """
+    try:
+        terms = shlex.split(query)
+    except ValueError:  # an unbalanced quote, mid-typing
+        terms = query.replace('"', ' ').split()
+    return [t for t in terms if t]
+
+
 def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> list[Hit]:
     query = query.strip()
     if not query and not cwd:
@@ -310,8 +329,17 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
         db = connect(readonly=True)
     except sqlite3.Error:
         return []
+    # Words separated by spaces mean all of them, each matched as a substring --
+    # the way every other search box works. Matching the whole string including
+    # its spaces, which is what one quoted phrase does, made any query of more
+    # than one word return nothing at all.
+    terms = terms_of(query)
+    # Only three characters or more can be looked up in a trigram index. Shorter
+    # terms ride along as a filter over whatever the longer ones found, so a two
+    # character word costs nothing as long as it has company.
+    indexable = [t for t in terms if len(t) >= 3]
     args: list[Any]
-    if not query:
+    if not terms:
         # Project filter on its own: the most recent thing said in it, which is
         # a useful way in even when you cannot remember any of the words.
         sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
@@ -320,11 +348,10 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
                  JOIN sessions s ON s.session = m.session
                  WHERE 1=1'''
         args = []
-    elif len(query) < 3:
-        # The trigram tokenizer cannot index anything shorter than three
-        # characters, which rules out most two character Japanese words. Scan
-        # instead -- but bounded to recent history, because a scan of the whole
-        # corpus takes tens of seconds and this runs on every keystroke.
+    elif not indexable:
+        # Nothing long enough to look up, so there is no way around reading the
+        # text -- bounded to recent history, because a scan of the whole corpus
+        # takes tens of seconds and this runs on every keystroke.
         row = db.execute(
             'SELECT ts FROM messages WHERE ts != \'\' ORDER BY ts DESC LIMIT 1 OFFSET ?',
             (RECENT_SCAN_ROWS,)).fetchone()
@@ -333,8 +360,8 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
                         COALESCE(s.summary,''), COALESCE(s.msg_count,0), COALESCE(s.ending,'')
                  FROM messages m
                  LEFT JOIN sessions s ON s.session = m.session
-                 WHERE m.ts > ? AND m.text LIKE ? ESCAPE '\\' '''
-        args = [floor, '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%']
+                 WHERE m.ts > ?'''
+        args = [floor]
     else:
         sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
                         COALESCE(s.summary,''), COALESCE(s.msg_count,0), COALESCE(s.ending,'')
@@ -342,7 +369,14 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
                  JOIN messages m ON m.id = f.rowid
                  LEFT JOIN sessions s ON s.session = m.session
                  WHERE messages_fts MATCH ?'''
-        args = [escape(query)]
+        args = [' AND '.join(escape(t) for t in indexable)]
+    # The index answers with trigrams, which is a superset: detail=none cannot
+    # tell a phrase from the same trigrams scattered about. Every term is
+    # therefore checked as a real substring here, which is also what makes the
+    # highlighting in the results honest.
+    for term in terms:
+        sql += " AND m.text LIKE ? ESCAPE '\\'"
+        args.append(like_arg(term))
     if source:
         sql += ' AND m.source = ?'
         args.append(source)

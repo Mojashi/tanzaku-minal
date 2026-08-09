@@ -36,7 +36,7 @@ import tty
 from typing import Any, NamedTuple
 
 from kitty.constants import kitten_exe
-from kitty.session_index import Hit, search, stats, update
+from kitty.session_index import Hit, search, stats, terms_of, update
 
 DEBOUNCE = 0.18
 MIN_QUERY = 2
@@ -195,20 +195,46 @@ def fit(text: str, width: int) -> str:
     return text if len(text) <= width else text[:max(0, width - 1)] + '…'
 
 
+def mark(piece: str, terms: list[str]) -> str:
+    """Every occurrence of every term, highlighted."""
+    low = piece.lower()
+    spans: list[tuple[int, int]] = []
+    for t in terms:
+        tl = t.lower()
+        i = low.find(tl)
+        while i >= 0:
+            spans.append((i, i + len(tl)))
+            i = low.find(tl, i + len(tl))
+    if not spans:
+        return piece
+    spans.sort()
+    out = []
+    at = 0
+    for a, b in spans:
+        if a < at:  # terms can overlap each other
+            continue
+        out.append(piece[at:a])
+        out.append(HIT + piece[a:b] + R + DIM)
+        at = b
+    out.append(piece[at:])
+    return ''.join(out)
+
+
 def snippet(text: str, query: str, width: int) -> str:
-    """The part of the message the query is in, with the query marked."""
+    """The part of the message the query is in, with the terms marked."""
     flat = re.sub(r'\s+', ' ', text.replace('\n', ' ')).strip()
-    idx = flat.lower().find(query.lower())
-    if idx < 0:
+    terms = terms_of(query)
+    low = flat.lower()
+    found = [(low.find(t.lower()), t) for t in terms]
+    found = [(i, t) for i, t in found if i >= 0]
+    if not found:
         return fit(flat, width)
+    # Start at the first term that appears; with several terms the interesting
+    # part of the message is wherever they begin, not the front of it.
+    idx = min(i for i, _t in found)
     start = max(0, idx - width // 3)
     piece = flat[start:start + width]
-    rel = idx - start
-    if rel < 0 or rel + len(query) > len(piece):
-        return fit(piece, width)
-    lead = '…' if start else ''
-    body = piece[:rel] + HIT + piece[rel:rel + len(query)] + R + DIM + piece[rel + len(query):]
-    return fit_ansi(lead + body, width)
+    return fit_ansi(('…' if start else '') + mark(piece, terms), width)
 
 
 def fit_ansi(text: str, width: int) -> str:
