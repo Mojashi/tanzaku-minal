@@ -22,25 +22,27 @@ Started for you by the layout when it is enabled with::
 import json
 import os
 import re
-import unicodedata
 import selectors
+import shlex
 import shutil
 import signal
-import shlex
 import subprocess
 import sys
 import termios
 import threading
 import time
 import tty
+import unicodedata
 from typing import Any, NamedTuple
 
+from kitty.closed_windows import tmux_executable
 from kitty.constants import kitten_exe
 from kitty.session_index import Hit, search, stats, terms_of, update
 
 DEBOUNCE = 0.18
 MIN_QUERY = 2
 LIVE_POLL = 2.0
+TMUX_EXE = tmux_executable()
 
 R = '\033[0m'
 DIM = '\033[2m'
@@ -72,10 +74,112 @@ def clip_right(text: str, width: int) -> str:
 def tmux_has(session: str) -> bool:
     try:
         return subprocess.run(
-            ['tmux', 'has-session', '-t', f'={session}'],
+            [TMUX_EXE, 'has-session', '-t', f'={session}'],
             capture_output=True, timeout=3).returncode == 0
     except Exception:
         return False
+
+
+def tmux_session_for_writer(path: str, source: str) -> tuple[str, bool]:
+    """Return (tmux session, has_live_writer) for an open transcript.
+
+    A newly started agent is put in a time-named tmux session because its
+    conversation id does not exist yet. The transcript is the reliable link:
+    find the agent process writing it, then walk its parents back to the tmux
+    pane that launched it.
+    """
+    if not path or not os.path.isfile(path):
+        return '', False
+    try:
+        opened = subprocess.run(['lsof', '-t', '--', path], capture_output=True, timeout=3, text=True)
+    except Exception:
+        return '', False
+    if opened.returncode:
+        return '', False
+
+    try:
+        opened_pids = {int(x) for x in opened.stdout.split()}
+    except ValueError:
+        return '', False
+    if not opened_pids:
+        return '', False
+    try:
+        processes = subprocess.run(
+            ['ps', '-axo', 'pid=,ppid=,tty=,comm='], capture_output=True, timeout=3, text=True)
+    except Exception:
+        return '', True
+    if processes.returncode:
+        return '', True
+    parents: dict[int, int] = {}
+    commands: dict[int, str] = {}
+    writer_ttys: dict[int, str] = {}
+    for line in processes.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) != 4:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        parents[pid] = ppid
+        writer_ttys[pid] = parts[2].removeprefix('/dev/')
+        commands[pid] = os.path.basename(parts[3]).lower()
+
+    writer_names = {
+        'codex': {'codex'},
+        'claude': {'claude'},
+        'agy': {'agy'},
+    }.get(source, {source})
+    writers = {pid for pid in opened_pids if commands.get(pid) in writer_names}
+    if not writers:
+        return '', False
+
+    try:
+        panes = subprocess.run(
+            [TMUX_EXE, 'list-panes', '-a', '-F', '#{session_name}|#{pane_pid}|#{pane_tty}'],
+            capture_output=True, timeout=3, text=True)
+    except Exception:
+        return '', True
+    if panes.returncode:
+        return '', True
+    pane_sessions: dict[int, str] = {}
+    tty_sessions: dict[str, str] = {}
+    for line in panes.stdout.splitlines():
+        parts = line.split('|', 2)
+        if len(parts) != 3:
+            continue
+        name, raw_pid, pane_tty = parts
+        try:
+            pane_sessions[int(raw_pid)] = name
+        except ValueError:
+            continue
+        tty_sessions[pane_tty.removeprefix('/dev/')] = name
+    for writer in writers:
+        # The pane's pty is a direct relationship and survives launcher
+        # wrappers or re-parenting that can make the PID walk inconclusive.
+        session = tty_sessions.get(writer_ttys.get(writer, ''))
+        if session:
+            return session, True
+        seen: set[int] = set()
+        pid = writer
+        while pid > 1 and pid not in seen:
+            seen.add(pid)
+            if pid in pane_sessions:
+                return pane_sessions[pid], True
+            pid = parents.get(pid, 0)
+    return '', True
+
+
+def tmux_session_for_hit(hit: Hit) -> tuple[str, bool]:
+    """Resolve a search hit to its real tmux session without double-resuming."""
+    # Prefer the process relationship. An earlier failed resume can have left
+    # an empty id-named tmux session beside the real time-named writer.
+    session, has_writer = tmux_session_for_writer(hit.path, hit.source)
+    if session or has_writer:
+        return session, has_writer
+    prefix = 'agy' if hit.source == 'agy' else ('claude' if hit.source == 'claude' else 'codex')
+    expected = f'{prefix}-{hit.session[:8]}'
+    return (expected, True) if tmux_has(expected) else ('', False)
 
 
 class Live(NamedTuple):
@@ -89,7 +193,11 @@ class Live(NamedTuple):
 
     @property
     def source(self) -> str:
-        return 'codex' if self.name.startswith('codex') else 'claude'
+        if self.name.startswith('codex'):
+            return 'codex'
+        if self.name.startswith('agy'):
+            return 'agy'
+        return 'claude'
 
 
 #: The title comes last so that a separator inside it cannot shift the fields.
@@ -106,7 +214,7 @@ def live_sessions() -> list[Live]:
     the conversation is doing now rather than what it was first asked.
     """
     try:
-        out = subprocess.run(['tmux', 'list-sessions', '-F', LIVE_FORMAT],
+        out = subprocess.run([TMUX_EXE, 'list-sessions', '-F', LIVE_FORMAT],
                              capture_output=True, timeout=5, text=True)
     except Exception:
         return []
@@ -153,12 +261,12 @@ def focus_window_running(session: str) -> bool:
                 for proc in w.get('foreground_processes', []):
                     if session in ' '.join(proc.get('cmdline') or []):
                         try:
-                            subprocess.run(
+                            focused = subprocess.run(
                                 [kitten_exe(), '@', 'focus-window', '--match', f'id:{w["id"]}'],
                                 capture_output=True, timeout=5)
                         except Exception:
                             return False
-                        return True
+                        return focused.returncode == 0
     return False
 
 
@@ -313,7 +421,7 @@ class UI:
         # Attached means it is open in a column right now; detached means it is
         # running with nobody watching it.
         mark = f'{GREEN}●{R}' if x.attached else f'{AMBER}○{R}'
-        tag = f'{BLUE}cx{R}' if x.source == 'codex' else f'{GREEN}cc{R}'
+        tag = f'{AMBER}ag{R}' if x.source == 'agy' else (f'{BLUE}cx{R}' if x.source == 'codex' else f'{GREEN}cc{R}')
         title = x.title.strip() or x.name
         head = f'{BOLD if cur else ""}{fit(title, inner - 4)}{R}'
         meta = f'{fit(home_relative(x.path), inner - 18)} · {ago(x.activity)} · {x.name}'
@@ -321,7 +429,7 @@ class UI:
 
     def hit_card(self, hit: Hit, cur: bool, inner: int) -> list[str]:
         bar = f'{AMBER}▍{R}' if cur else ' '
-        tag = f'{BLUE}cx{R}' if hit.source == 'codex' else f'{GREEN}cc{R}'
+        tag = f'{AMBER}ag{R}' if hit.source == 'agy' else (f'{BLUE}cx{R}' if hit.source == 'codex' else f'{GREEN}cc{R}')
         head = f'{BOLD if cur else ""}{fit(home_relative(hit.cwd) or "?", inner - 8)}{R}'
         # What the conversation was for, which the matching line on its own
         # rarely says. Without it every result is a fragment out of context.
@@ -495,6 +603,14 @@ class UI:
     def total(self) -> int:
         return len(self.visible_live()) + len(self.hits)
 
+    def launch_column(self, args: list[str], success: str) -> None:
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+            self.status = success if result.returncode == 0 else f'failed: {(result.stderr or result.stdout).strip()[:120]}'
+        except Exception as e:
+            self.status = f'failed: {e}'
+        self.dirty = True
+
     def open_selected(self) -> None:
         live = self.visible_live()
         if self.sel < len(live):
@@ -505,29 +621,37 @@ class UI:
             return
         hit = self.hits[idx]
         # If the conversation is already live in tmux, go to it rather than
-        # starting a second copy of it. c and x name the tmux session after the
-        # conversation precisely so this lookup is exact rather than a guess.
-        prefix = 'claude' if hit.source == 'claude' else 'codex'
-        sess = f'{prefix}-{hit.session[:8]}'
-        if tmux_has(sess):
+        # starting a second copy. New conversations have time-named sessions,
+        # while resumed ones are usually id-named, so resolve both forms.
+        sess, has_writer = tmux_session_for_hit(hit)
+        if sess:
+            if focus_window_running(sess):
+                self.status = f'focused {sess}'
+                self.dirty = True
+                return
             args = [kitten_exe(), '@', 'launch', '--location', 'before', '--title', sess]
             if hit.cwd and os.path.isdir(hit.cwd):
                 args += ['--cwd', hit.cwd]
-            args += ['--', 'tmux', 'attach', '-t', f'={sess}']
-            try:
-                subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.status = f'attached {sess}'
-            except Exception as e:
-                self.status = f'failed: {e}'
+            args += ['--', TMUX_EXE, 'attach', '-t', f'={sess}']
+            self.launch_column(args, f'attached {sess}')
+            return
+        if has_writer:
+            self.status = f'already running {hit.session[:8]}'
             self.dirty = True
             return
 
         # Go through the user's own launcher rather than running the agent
-        # directly: c and x set up direnv, the flags they always pass, and the
+        # directly: c, x, and a set up direnv, the flags they always pass, and the
         # tmux session everything else expects to find.
-        fn = 'c' if hit.source == 'claude' else 'x'
-        resume = f'--resume {shlex.quote(hit.session)}' if hit.source == 'claude' \
-            else f'resume {shlex.quote(hit.session)}'
+        if hit.source == 'claude':
+            fn = 'c'
+            resume = f'--resume {shlex.quote(hit.session)}'
+        elif hit.source == 'codex':
+            fn = 'x'
+            resume = f'resume {shlex.quote(hit.session)}'
+        else:
+            fn = 'a'
+            resume = f'--conversation {shlex.quote(hit.session)}'
         line = f'{fn} {resume}'
         if hit.cwd and os.path.isdir(hit.cwd):
             line = f'cd {shlex.quote(hit.cwd)} && {line}'
@@ -536,13 +660,7 @@ class UI:
             args += ['--cwd', hit.cwd]
         # -i so the functions from .zshrc are defined.
         args += ['--', 'zsh', '-ic', line]
-        try:
-            # Fire and forget: waiting on this would freeze the input thread.
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.status = f'opened {hit.session[:8]}'
-        except Exception as e:
-            self.status = f'failed: {e}'
-        self.dirty = True
+        self.launch_column(args, f'opened {hit.session[:8]}')
 
     def open_live(self, x: Live) -> None:
         """Go to an ongoing session. Runs off the input thread: it asks kitty
@@ -554,13 +672,8 @@ class UI:
         args = [kitten_exe(), '@', 'launch', '--location', 'before', '--title', x.name]
         if x.path and os.path.isdir(x.path):
             args += ['--cwd', x.path]
-        args += ['--', 'tmux', 'attach', '-t', f'={x.name}']
-        try:
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.status = f'attached {x.name}'
-        except Exception as e:
-            self.status = f'failed: {e}'
-        self.dirty = True
+        args += ['--', TMUX_EXE, 'attach', '-t', f'={x.name}']
+        self.launch_column(args, f'attached {x.name}')
 
     # MARK: input
 

@@ -19,6 +19,7 @@ that is still being written is re-read from where it left off.
 
 import json
 import os
+import re
 import shlex
 import sqlite3
 import sys
@@ -28,6 +29,7 @@ from typing import Any, NamedTuple
 
 CLAUDE_DIR = os.path.expanduser('~/.claude/projects')
 CODEX_DIR = os.path.expanduser('~/.codex/sessions')
+AGY_BRAIN_DIR = os.path.expanduser('~/.gemini/antigravity-cli/brain')
 DB_PATH = os.path.expanduser('~/.cache/kitty-session-search/index.db')
 
 SCHEMA = '''
@@ -122,6 +124,7 @@ class Hit(NamedTuple):
     msg_count: int = 0
     hits: int = 1       # matches in this session, once results are grouped
     ending: str = ''    # '', 'error', 'cut' or 'stopped'
+    path: str = ''      # transcript path, used to find a live writer
 
 
 def connect(readonly: bool = False) -> sqlite3.Connection:
@@ -207,6 +210,69 @@ def codex_messages(path: str, start_line: int) -> Iterator[tuple[int, str, str, 
                        text[:MAX_TEXT], cwd, False)
 
 
+def clean_user_content(content: str) -> str:
+    if not content:
+        return ''
+    m = re.search(r'<USER_REQUEST>(.*?)</USER_REQUEST>', content, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r'<system_instructions>.*?</system_instructions>\s*(.*)', content, re.DOTALL)
+    if m2:
+        return m2.group(1).strip()
+    return content.strip()
+
+
+def agy_messages(path: str, start_line: int) -> Iterator[tuple[int, str, str, str, str, bool]]:
+    """(line, role, ts, text, cwd, is_error) for an Antigravity transcript file."""
+    cwd = ''
+    with open(path, encoding='utf-8', errors='replace') as f:
+        for i, line in enumerate(f):
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if not cwd:
+                tool_calls = d.get('tool_calls')
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if isinstance(tc, dict) and isinstance(tc.get('args'), dict):
+                            args = tc['args']
+                            p = args.get('Cwd') or args.get('SearchPath') or args.get('DirectoryPath')
+                            if isinstance(p, str) and p.startswith('/'):
+                                cwd = p
+                                break
+            if i < start_line:
+                continue
+            stype = d.get('type')
+            source = d.get('source')
+            ts = d.get('created_at') or ''
+            text = ''
+            role = ''
+            is_err = d.get('status') == 'ERROR'
+            if stype == 'USER_INPUT':
+                role = 'user'
+                text = clean_user_content(d.get('content') or '')
+            elif stype == 'PLANNER_RESPONSE':
+                role = 'assistant'
+                content = d.get('content') or ''
+                tc_text = ''
+                tool_calls = d.get('tool_calls')
+                if isinstance(tool_calls, list):
+                    tc_names = [tc.get('name') for tc in tool_calls if isinstance(tc, dict) and tc.get('name')]
+                    if tc_names:
+                        tc_text = ' '.join(f'[{name}]' for name in tc_names)
+                text = f'{content} {tc_text}'.strip()
+            elif source == 'MODEL' and stype not in ('PLANNER_RESPONSE', 'CONVERSATION_HISTORY'):
+                role = 'tool'
+                text = str(d.get('content') or '')
+            if text:
+                yield (i, role, ts, text[:MAX_TEXT], cwd, is_err)
+
+
 def session_files() -> Iterator[tuple[str, str, str]]:
     """(path, source, session_id) for everything worth indexing."""
     for root, _dirs, names in os.walk(CLAUDE_DIR):
@@ -221,6 +287,11 @@ def session_files() -> Iterator[tuple[str, str, str]]:
             stem = name[:-6]
             session = stem[-36:] if len(stem) > 36 else stem
             yield os.path.join(root, name), 'codex', session
+    if os.path.exists(AGY_BRAIN_DIR):
+        for name in os.listdir(AGY_BRAIN_DIR):
+            fp = os.path.join(AGY_BRAIN_DIR, name, '.system_generated', 'logs', 'transcript.jsonl')
+            if os.path.exists(fp):
+                yield fp, 'agy', name
 
 
 # MARK: indexing
@@ -249,7 +320,12 @@ def update(progress: bool = False, budget: float = 0.0) -> tuple[int, int]:
         # filling the disk is far worse than an index that is behind.
         if done % 200 == 0 and free_bytes() < MIN_FREE_BYTES:
             break
-        reader = claude_messages if source == 'claude' else codex_messages
+        if source == 'claude':
+            reader = claude_messages
+        elif source == 'codex':
+            reader = codex_messages
+        else:
+            reader = agy_messages
         rows = []
         cwd = ''
         first_ts = last_ts = ''
@@ -342,7 +418,7 @@ def recent_sessions(db: sqlite3.Connection, cwd: str, source: str, limit: int) -
     same question. There are 50k sessions against a million messages, and only
     one message per session is ever shown.
     """
-    inner = 'SELECT session, source, cwd, summary, msg_count, ending, last_ts FROM sessions WHERE 1=1'
+    inner = 'SELECT session, source, cwd, summary, msg_count, ending, last_ts, path FROM sessions WHERE 1=1'
     args: list[Any] = []
     if cwd:
         inner += ' AND cwd LIKE ?'
@@ -360,7 +436,7 @@ def recent_sessions(db: sqlite3.Connection, cwd: str, source: str, limit: int) -
     except sqlite3.Error:
         return []
     out = []
-    for session, src, scwd, summary, msg_count, ending, last_ts in rows:
+    for session, src, scwd, summary, msg_count, ending, last_ts, path in rows:
         try:
             latest = db.execute(
                 'SELECT role, ts, text FROM messages WHERE session = ? ORDER BY ts DESC LIMIT 1',
@@ -369,7 +445,7 @@ def recent_sessions(db: sqlite3.Connection, cwd: str, source: str, limit: int) -
             latest = None
         role, ts, text = latest if latest else ('', last_ts or '', '')
         out.append(Hit(session, src or '', scwd or '', role or '', ts or last_ts or '',
-                       text or '', summary or '', msg_count or 0, 1, ending or ''))
+                       text or '', summary or '', msg_count or 0, 1, ending or '', path or ''))
     return out
 
 
@@ -407,14 +483,16 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
             (RECENT_SCAN_ROWS,)).fetchone()
         floor = row[0] if row else ''
         sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
-                        COALESCE(s.summary,''), COALESCE(s.msg_count,0), COALESCE(s.ending,'')
+                        COALESCE(s.summary,''), COALESCE(s.msg_count,0), 1,
+                        COALESCE(s.ending,''), COALESCE(s.path,'')
                  FROM messages m
                  LEFT JOIN sessions s ON s.session = m.session
                  WHERE m.ts > ?'''
         args = [floor]
     else:
         sql = '''SELECT m.session, m.source, COALESCE(s.cwd,''), m.role, m.ts, m.text,
-                        COALESCE(s.summary,''), COALESCE(s.msg_count,0), COALESCE(s.ending,'')
+                        COALESCE(s.summary,''), COALESCE(s.msg_count,0), 1,
+                        COALESCE(s.ending,''), COALESCE(s.path,'')
                  FROM messages_fts f
                  JOIN messages m ON m.id = f.rowid
                  LEFT JOIN sessions s ON s.session = m.session
