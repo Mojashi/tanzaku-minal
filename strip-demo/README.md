@@ -45,7 +45,7 @@ Ghostty の split 系をそのまま移植してある。kitty 既定（`ctrl+sh
 | `cmd+ctrl+=` | `equalize_splits` | 幅を全部合わせる（合計は維持） |
 | `cmd+shift+enter` | `toggle_split_zoom` | ズーム（`toggle_layout stack`） |
 | `cmd+w` | `close_surface` | カラムを閉じる |
-| `cmd+t` | （対応物なし） | 閉じたカラムを開き直す |
+| `cmd+t` / `cmd+shift+t` | （対応物なし） | 閉じたカラムを開き直す |
 | `cmd+n` / `cmd+shift+n` | （対応物なし） | 新しいタブ / 新しい OS ウィンドウ |
 | `cmd+ctrl+shift+n` | （対応物なし） | 行き先を選んでカラムを切り出す |
 | `cmd+alt+w` | `close_tab:this` | タブを閉じる |
@@ -59,10 +59,8 @@ Ghostty では `new_split:down` なので、縦分割のつもりで押してペ
 `map cmd+shift+d no_op` で無効化した（同一トリガに複数定義があるとき kitty は
 最後のものを使う ―― `keys.py` の `matches = [matches[-1]]`）。
 
-**`cmd+shift+t` も同じ理由で潰してある。** かつて `detach_window new-tab` を当てていたが、
-真隣の `cmd+t`（閉じたカラムの復元）と押し間違えると、そのカラムだけ新しいタブへ移り
-**短冊が丸ごと消えたように見える**（短冊もサイドバーもタブ単位なので、移った先には
-何も無いように見える）。切り出しの入口は行き先を訊く `cmd+ctrl+shift+n` 1 つにした。
+**`cmd+shift+t` は `cmd+t` と同じ閉じたカラムの復元。** カラムをタブへ切り出す操作は
+`cmd+ctrl+shift+n` で行き先を選ぶ。
 
 短冊固有（Ghostty に対応物が無いもの）:
 

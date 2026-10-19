@@ -32,7 +32,6 @@ from kitty.types import WindowResizeDrag
 
 from .child import cached_process_data, default_env, process_data_cache, set_default_env
 from .cli import create_opts, green, parse_args
-from .closed_windows import MAX_CLOSED_WINDOWS, ClosedWindow, relaunch_argv
 from .cli_stub import CLIOptions, SaveAsSessionOptions
 from .clipboard import (
     Clipboard,
@@ -42,6 +41,7 @@ from .clipboard import (
     set_clipboard_string,
     set_primary_selection,
 )
+from .closed_windows import MAX_CLOSED_WINDOWS, ClosedWindow, relaunch_argv
 from .colors import ColorSchemes, theme_colors
 from .conf.utils import BadLine, KeyAction, to_cmdline
 from .config import common_opts_as_dict, prepare_config_file_for_editing, store_effective_config
@@ -2989,12 +2989,13 @@ class Boss:
             argv = tuple(window.child.foreground_cmdline or ())
         except Exception:
             return
-        if not cwd and not argv:
+        if not cwd and not argv and not last_cmd:
             return
-        self.closed_windows.append(ClosedWindow(cwd, argv, window.title or ''))
+        self.closed_windows.append(ClosedWindow(cwd, argv, window.title or '', last_cmd))
         del self.closed_windows[:-MAX_CLOSED_WINDOWS]
 
     @ac('win', '''
+            last_cmd = getattr(window, 'last_cmd_cmdline', '') or ''
         Reopen the most recently closed window
 
         Brings back its working directory and the program it was running. Programs that
@@ -3007,10 +3008,12 @@ class Boss:
                 ring_bell(self.active_tab.os_window_id if self.active_tab else 0)
             return
         rec = self.closed_windows.pop()
-        args = ['--cwd', rec.cwd] if rec.cwd else []
+        args = ['--location', 'after']
+        if rec.cwd:
+            args += ['--cwd', rec.cwd]
         if rec.title:
             args += ['--title', rec.title]
-        args += relaunch_argv(rec.argv)
+        args += relaunch_argv(rec.argv, rec.last_cmd)
         self.launch(*args)
 
     def get_active_selection(self) -> str | None:
