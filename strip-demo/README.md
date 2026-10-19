@@ -24,7 +24,7 @@ kitty のレイアウト。scrollable-tiling WM（niri / PaperWM）と同じく�
 ## 起動
 
 ```sh
-~/repos/kitty/kitty/launcher/kitty --config ~/repos/kitty-strip-demo/kitty.conf
+~/repos/kitty/kitty/launcher/kitty --config ~/repos/kitty/strip-demo/kitty.conf
 ```
 
 Python だけの変更なら再ビルド不要。kitty を再起動するだけで反映される。
@@ -40,7 +40,7 @@ Ghostty の split 系をそのまま移植してある。kitty 既定（`ctrl+sh
 |---|---|---|
 | `cmd+d` | `new_split:right` | 新しいカラムを開く |
 | `cmd+[` / `cmd+]` | `goto_split:previous/next` | フォーカス移動（ビューポートが追従） |
-| `cmd+alt+←` / `→` | `goto_split:left/right` | 左右のカラムへ |
+| `cmd+alt+←` / `→` | （対応物なし） | 前 / 次のタブへ移動 |
 | `cmd+ctrl+←` / `→` | `resize_split` | **このカラムだけ**を伸縮（＝短冊全体が伸縮） |
 | `cmd+ctrl+=` | `equalize_splits` | 幅を全部合わせる（合計は維持） |
 | `cmd+shift+enter` | `toggle_split_zoom` | ズーム（`toggle_layout stack`） |

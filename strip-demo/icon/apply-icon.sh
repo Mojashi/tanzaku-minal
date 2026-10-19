@@ -32,11 +32,19 @@ iconutil -c icns strip.iconset -o strip.icns
 [ -f "$HERE/kitty-original.icns" ] || cp "$APP/Contents/Resources/kitty.icns" "$HERE/kitty-original.icns"
 cp strip.icns "$APP/Contents/Resources/kitty.icns"
 
-# macOS caches icons hard; bumping the bundle mtime and restarting the Dock is
-# what actually makes the new one show up.
+# macOS prioritizes Assets.car (and CFBundleIconName in Info.plist) over kitty.icns.
+# Remove Assets.car and CFBundleIconName so macOS uses kitty.icns.
+[ -f "$APP/Contents/Resources/Assets.car" ] && rm -f "$APP/Contents/Resources/Assets.car"
+/usr/libexec/PlistBuddy -c "Delete :CFBundleIconName" "$APP/Contents/Info.plist" 2>/dev/null || true
+
+# macOS caches icons hard; touch the bundle, re-register with LaunchServices, and clear cache.
 touch "$APP" "$APP/Contents/Info.plist"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true
+rm -rf /private/var/folders/*/*/*/com.apple.dock.iconcache 2>/dev/null || true
+rm -rf /private/var/folders/*/*/*/com.apple.iconservices* 2>/dev/null || true
 killall Dock 2>/dev/null || true
 
 rm -f r16.png r32.png r64.png r128.png r256.png r512.png r1024.png
+rm -rf "$HERE/strip.iconset"
 echo "applied to $APP"
 echo "to restore: cp '$HERE/kitty-original.icns' '$APP/Contents/Resources/kitty.icns'"
