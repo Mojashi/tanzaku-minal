@@ -623,6 +623,13 @@ class Strip(Layout):
 
     # MARK: Session state
 
+    def column_width(self, group_id: int) -> int | None:
+        return self.widths.get(group_id)
+
+    def set_column_width(self, group_id: int, cells: int) -> None:
+        # _sync_widths only fills in widths it has not seen, so this sticks.
+        self.widths[group_id] = max(self.min_columns, cells)
+
     def layout_state(self) -> dict[str, Any]:
         return {'offset': self.offset}
 

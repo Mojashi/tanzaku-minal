@@ -153,6 +153,7 @@ from .session import (
     most_recent_session,
     save_as_session,
 )
+from .session_restore import SessionKeeper
 from .shaders.slang import load_shader_programs
 from .simple_cli_definitions import grab_keyboard_docs
 from .tabs import SpecialWindow, SpecialWindowInstance, Tab, TabDict, TabManager
@@ -424,6 +425,8 @@ class Boss:
         self.clipboard_buffers: dict[str, str] = {}
         # Most recently closed windows, newest last, for reopen_closed_window.
         self.closed_windows: list[ClosedWindow] = []
+        # The strip as it was, kept on disk so a restart or a power cut can bring it back.
+        self.session_keeper = SessionKeeper(self)
         self.update_check_process: Optional['PopenType[bytes]'] = None
         self.window_id_map: WeakValueDictionary[int, Window] = WeakValueDictionary()
         self.color_settings_at_startup: dict[str, Color | None] = {k: opts[k] for k in opts if isinstance(opts[k], Color) or k in nullable_colors}
@@ -1528,6 +1531,9 @@ class Boss:
                 self.launch_urls(*urls)
             else:
                 self.startup_first_child(first_os_window_id, startup_sessions=startup_sessions)
+            # Bring back the last strip only when kitty was started bare: a
+            # session file or a program on the command line says what to show.
+            self.session_keeper.start(restore=not urls and not self.args.args and not self.args.session and not get_options().startup_session)
 
         if (opts := get_options()).update_check_interval > 0 and not self.update_check_started and getattr(sys, 'frozen', False):
             from .update_check import run_update_check
@@ -2413,6 +2419,7 @@ class Boss:
         if not needs_confirmation:
             if not self._call_on_quit_watchers({'confirmed': True}):
                 return
+            self.session_keeper.save_now()
             set_application_quit_request(IMPERATIVE_CLOSE_REQUESTED)
             return
         if current_application_quit_request() == CLOSE_BEING_CONFIRMED:
@@ -2440,6 +2447,7 @@ class Boss:
             if not self._call_on_quit_watchers({'confirmed': True}):
                 set_application_quit_request(NO_CLOSE_REQUESTED)
                 return
+            self.session_keeper.save_now()
         set_application_quit_request(IMPERATIVE_CLOSE_REQUESTED if confirmed else NO_CLOSE_REQUESTED)
 
     def notify_on_os_window_death(self, address: str) -> None:
@@ -2987,6 +2995,7 @@ class Boss:
         try:
             cwd = window.cwd_of_child or ''
             argv = tuple(window.child.foreground_cmdline or ())
+            last_cmd = getattr(window, 'last_cmd_cmdline', '') or ''
         except Exception:
             return
         if not cwd and not argv and not last_cmd:
@@ -2995,7 +3004,6 @@ class Boss:
         del self.closed_windows[:-MAX_CLOSED_WINDOWS]
 
     @ac('win', '''
-            last_cmd = getattr(window, 'last_cmd_cmdline', '') or ''
         Reopen the most recently closed window
 
         Brings back its working directory and the program it was running. Programs that
