@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # License: GPLv3 Copyright: 2026, strip layout prototype
 
-"""A full text index over Claude Code and Codex sessions.
+"""A full text index over Claude Code, Codex, Antigravity and Kimi sessions.
 
 Both agents keep their history as JSONL, one file per session, in formats that
 have changed over time -- so the extraction here is deliberately shape driven
@@ -25,11 +25,13 @@ import sqlite3
 import sys
 import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Any, NamedTuple
 
 CLAUDE_DIR = os.path.expanduser('~/.claude/projects')
 CODEX_DIR = os.path.expanduser('~/.codex/sessions')
 AGY_BRAIN_DIR = os.path.expanduser('~/.gemini/antigravity-cli/brain')
+KIMI_DIR = os.path.expanduser('~/.kimi-code/sessions')
 DB_PATH = os.path.expanduser('~/.cache/kitty-session-search/index.db')
 
 SCHEMA = '''
@@ -273,6 +275,70 @@ def agy_messages(path: str, start_line: int) -> Iterator[tuple[int, str, str, st
                 yield (i, role, ts, text[:MAX_TEXT], cwd, is_err)
 
 
+def kimi_ts(ms: Any) -> str:
+    """Kimi stamps records in epoch milliseconds; the index sorts ISO strings."""
+    if not isinstance(ms, (int, float)):
+        return ''
+    dt = datetime.fromtimestamp(ms / 1000, timezone.utc)
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.') + f'{int(ms) % 1000:03d}Z'
+
+
+def kimi_messages(path: str, start_line: int) -> Iterator[tuple[int, str, str, str, str, bool]]:
+    """(line, role, ts, text, cwd, is_error) for one agent's wire file in a Kimi session.
+
+    A wire file is an event log, and only agent.message.appended carries the
+    conversation. The cwd is not in it at all, only in the session's state.json.
+    """
+    cwd = ''
+    try:
+        # <session>/agents/<agent>/wire.jsonl
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(path))), 'state.json')) as sf:
+            cwd = json.load(sf).get('cwd') or ''
+    except (OSError, ValueError, AttributeError):
+        pass
+    # Held back one message, because whether a turn failed is only said by the
+    # event after its last message.
+    pending: tuple[int, str, str, str, str, bool] | None = None
+    with open(path, encoding='utf-8', errors='replace') as f:
+        for i, line in enumerate(f):
+            if i < start_line or not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get('type') == 'agent.turn.ended':
+                if pending and d.get('outcome') == 'failed':
+                    pending = pending[:5] + (True,)
+                continue
+            if d.get('type') != 'agent.message.appended' or not isinstance(d.get('message'), dict):
+                continue
+            meta = d['message'].get('meta')
+            msg = d['message'].get('message')
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get('role') or ''
+            # Background task notifications arrive as user turns, but nobody
+            # said them, and a session ending on one was not left unanswered.
+            if role == 'user' and isinstance(meta, dict) and meta.get('source') == 'notify':
+                role = 'tool'
+            # Thinking is a "think" part, which flatten() passes over.
+            text = flatten(msg.get('content'))
+            calls = msg.get('toolCalls')
+            if isinstance(calls, list):
+                names = [c.get('name') for c in calls if isinstance(c, dict) and c.get('name')]
+                if names:
+                    text = f"{text} {' '.join(f'[{n}]' for n in names)}".strip()
+            if role and text:
+                if pending:
+                    yield pending
+                pending = (i, role, kimi_ts(d.get('time')), text[:MAX_TEXT], cwd, False)
+    if pending:
+        yield pending
+
+
 def session_files() -> Iterator[tuple[str, str, str]]:
     """(path, source, session_id) for everything worth indexing."""
     for root, _dirs, names in os.walk(CLAUDE_DIR):
@@ -292,6 +358,18 @@ def session_files() -> Iterator[tuple[str, str, str]]:
             fp = os.path.join(AGY_BRAIN_DIR, name, '.system_generated', 'logs', 'transcript.jsonl')
             if os.path.exists(fp):
                 yield fp, 'agy', name
+    # One wire file per agent, subagents included, all filed under the session:
+    # a swarm does most of its talking in subagents. main goes first so that the
+    # session's summary is what it was asked, not what it delegated.
+    for root, dirs, _names in os.walk(KIMI_DIR):
+        if os.path.basename(root) != 'agents':
+            continue
+        dirs.clear()
+        session = os.path.basename(os.path.dirname(root))
+        for agent in sorted(os.listdir(root), key=lambda a: a != 'main'):
+            fp = os.path.join(root, agent, 'wire.jsonl')
+            if os.path.exists(fp):
+                yield fp, 'kimi', session
 
 
 # MARK: indexing
@@ -324,6 +402,8 @@ def update(progress: bool = False, budget: float = 0.0) -> tuple[int, int]:
             reader = claude_messages
         elif source == 'codex':
             reader = codex_messages
+        elif source == 'kimi':
+            reader = kimi_messages
         else:
             reader = agy_messages
         rows = []
@@ -372,7 +452,10 @@ def update(progress: bool = False, budget: float = 0.0) -> tuple[int, int]:
                      last_ts=COALESCE(NULLIF(excluded.last_ts,''), sessions.last_ts),
                      msg_count=COALESCE(sessions.msg_count,0) + excluded.msg_count,
                      summary=COALESCE(NULLIF(sessions.summary,''), excluded.summary),
-                     ending=excluded.ending''',
+                     -- A session with several files (Kimi's subagents) stopped
+                     -- the way its first file, the main agent, did.
+                     ending=CASE WHEN excluded.path = sessions.path THEN excluded.ending
+                                 ELSE sessions.ending END''',
                 (session, source, cwd, path, first_ts, last_ts, len(rows), summary, ending))
             db.execute('INSERT OR REPLACE INTO files(path, size, mtime, msg_count) VALUES (?,?,?,?)',
                        (path, size, mtime, next_line))

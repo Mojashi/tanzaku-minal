@@ -51,6 +51,7 @@ REV = '\033[7m'
 AMBER = '\033[38;5;214m'
 GREEN = '\033[38;5;149m'
 BLUE = '\033[38;5;110m'
+VIOLET = '\033[38;5;141m'
 GREY = '\033[38;5;244m'
 HIT = '\033[38;5;214m\033[1m'
 RED = '\033[38;5;203m'
@@ -129,6 +130,8 @@ def tmux_session_for_writer(path: str, source: str) -> tuple[str, bool]:
         'codex': {'codex'},
         'claude': {'claude'},
         'agy': {'agy'},
+        # kimi-code rewrites its argv, so ps can show either name.
+        'kimi': {'kimi', 'kimi-code'},
     }.get(source, {source})
     writers = {pid for pid in opened_pids if commands.get(pid) in writer_names}
     if not writers:
@@ -170,6 +173,12 @@ def tmux_session_for_writer(path: str, source: str) -> tuple[str, bool]:
     return '', True
 
 
+def source_tag(source: str) -> str:
+    return {
+        'agy': f'{AMBER}ag{R}', 'codex': f'{BLUE}cx{R}', 'kimi': f'{VIOLET}km{R}',
+    }.get(source, f'{GREEN}cc{R}')
+
+
 def tmux_session_for_hit(hit: Hit) -> tuple[str, bool]:
     """Resolve a search hit to its real tmux session without double-resuming."""
     # Prefer the process relationship. An earlier failed resume can have left
@@ -177,6 +186,8 @@ def tmux_session_for_hit(hit: Hit) -> tuple[str, bool]:
     session, has_writer = tmux_session_for_writer(hit.path, hit.source)
     if session or has_writer:
         return session, has_writer
+    if hit.source == 'kimi':
+        return '', False  # runs straight in a column, never under tmux
     prefix = 'agy' if hit.source == 'agy' else ('claude' if hit.source == 'claude' else 'codex')
     expected = f'{prefix}-{hit.session[:8]}'
     return (expected, True) if tmux_has(expected) else ('', False)
@@ -421,7 +432,7 @@ class UI:
         # Attached means it is open in a column right now; detached means it is
         # running with nobody watching it.
         mark = f'{GREEN}●{R}' if x.attached else f'{AMBER}○{R}'
-        tag = f'{AMBER}ag{R}' if x.source == 'agy' else (f'{BLUE}cx{R}' if x.source == 'codex' else f'{GREEN}cc{R}')
+        tag = source_tag(x.source)
         title = x.title.strip() or x.name
         head = f'{BOLD if cur else ""}{fit(title, inner - 4)}{R}'
         meta = f'{fit(home_relative(x.path), inner - 18)} · {ago(x.activity)} · {x.name}'
@@ -429,7 +440,7 @@ class UI:
 
     def hit_card(self, hit: Hit, cur: bool, inner: int) -> list[str]:
         bar = f'{AMBER}▍{R}' if cur else ' '
-        tag = f'{AMBER}ag{R}' if hit.source == 'agy' else (f'{BLUE}cx{R}' if hit.source == 'codex' else f'{GREEN}cc{R}')
+        tag = source_tag(hit.source)
         head = f'{BOLD if cur else ""}{fit(home_relative(hit.cwd) or "?", inner - 8)}{R}'
         # What the conversation was for, which the matching line on its own
         # rarely says. Without it every result is a fragment out of context.
@@ -649,6 +660,11 @@ class UI:
         elif hit.source == 'codex':
             fn = 'x'
             resume = f'resume {shlex.quote(hit.session)}'
+        elif hit.source == 'kimi':
+            # No launcher function for kimi; it is run as is, like the
+            # session restore does.
+            fn = 'kimi'
+            resume = f'-S {shlex.quote(hit.session)}'
         else:
             fn = 'a'
             resume = f'--conversation {shlex.quote(hit.session)}'
