@@ -390,6 +390,19 @@ def escape(query: str) -> str:
     return '"' + query.replace('"', '""') + '"'
 
 
+def trigram_match(term: str) -> str:
+    """A MATCH expression that finds every message containing all of term's trigrams.
+
+    The term itself cannot be asked for: with detail=none anything longer than
+    three characters is a phrase of trigrams, and phrase queries are an error
+    there. That error was swallowed as "no results", so every word of four
+    characters or more found nothing. Asking for the trigrams one by one gives
+    the same superset, and the LIKE in search() narrows it to real substrings.
+    """
+    grams = dict.fromkeys(term[i:i + 3] for i in range(len(term) - 2))
+    return ' AND '.join(escape(g) for g in grams)
+
+
 def like_arg(term: str) -> str:
     return '%' + term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
 
@@ -497,7 +510,7 @@ def search(query: str, limit: int = 200, source: str = '', cwd: str = '') -> lis
                  JOIN messages m ON m.id = f.rowid
                  LEFT JOIN sessions s ON s.session = m.session
                  WHERE messages_fts MATCH ?'''
-        args = [' AND '.join(escape(t) for t in indexable)]
+        args = [' AND '.join(trigram_match(t) for t in indexable)]
     # The index answers with trigrams, which is a superset: detail=none cannot
     # tell a phrase from the same trigrams scattered about. Every term is
     # therefore checked as a real substring here, which is also what makes the
