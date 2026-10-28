@@ -36,6 +36,12 @@ if TYPE_CHECKING:
 
 STATE_PATH = os.path.expanduser('~/.local/state/kitty-strip/last-session.json')
 ERROR_LOG = os.path.join(os.path.dirname(STATE_PATH), 'errors.log')
+HISTORY_KEEP = 48  # generations of the record kept under history/
+HISTORY_EVERY = 600.0  # seconds between generations, unless sessions disappear
+JOURNAL_MAX = 512 * 1024  # bytes a journal may grow to before its older half goes
+#: Right after a reboot the machine is under heavy load (dozens of agents
+#: starting at once) and ps alone has taken over 5 seconds.
+COMMAND_TIMEOUT = 30.0
 SAVE_INTERVAL = 60.0  # seconds
 CLAUDE_SESSIONS = os.path.expanduser('~/.claude/sessions')
 CODEX_SESSIONS = os.path.expanduser('~/.codex/sessions')
@@ -43,6 +49,9 @@ KIMI_SESSIONS = os.path.expanduser('~/.kimi-code/sessions')
 UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 KIMI_ID = re.compile(r'session_[0-9a-f-]{36}')
 AGENTS = ('claude', 'codex', 'kimi')
+#: Right after a reboot the network is not up yet, and Codex, started then,
+#: fails its first account check and exits. Every agent waits for it instead.
+WAIT_FOR_NETWORK = "until curl -s -o /dev/null -m 3 https://chatgpt.com; do printf '\\rネットワーク待ち…'; sleep 2; done; "
 
 
 # MARK: The record
@@ -56,11 +65,11 @@ class Conversation:
     def resume_in(self, cwd: str) -> str:
         # The same command lines the c / x shell functions build, so a restored
         # conversation runs exactly like one started by hand.
-        project = f'cd {shlex.quote(cwd)} && direnv allow . 2>/dev/null;'
+        project = f'{WAIT_FOR_NETWORK}cd {shlex.quote(cwd)} && direnv allow . 2>/dev/null;'
         if self.kind == 'claude':
             return f'{project} CLAUDE_CODE_NO_FLICKER=1 direnv exec . claude --dangerously-skip-permissions -r {self.id}'
         if self.kind == 'kimi':
-            return f'cd {shlex.quote(cwd)} && kimi -S {self.id}'
+            return f'{WAIT_FOR_NETWORK}cd {shlex.quote(cwd)} && kimi -S {self.id}'
         return f'{project} direnv exec . codex --dangerously-bypass-approvals-and-sandbox resume {self.id}'
 
 
@@ -71,6 +80,8 @@ class Pane:
     conversation: Conversation | None = None
     #: What the pane was started with, replayed only when it is not a conversation.
     command: str = ''
+    #: The pane's shell, for recognising the same pane in the next record. Not used on restore.
+    pid: int = 0
 
     def restart_command(self, running: set[str]) -> str:
         """The shell line that puts this pane back."""
@@ -123,7 +134,7 @@ class Snapshot:
     def from_json(cls, data: dict[str, Any]) -> 'Snapshot':
         def pane(p: dict[str, Any]) -> Pane:
             c = p.get('conversation')
-            return Pane(p['cwd'], p.get('title', ''), Conversation(c['kind'], c['id']) if c else None, p.get('command', ''))
+            return Pane(p['cwd'], p.get('title', ''), Conversation(c['kind'], c['id']) if c else None, p.get('command', ''), p.get('pid', 0))
 
         def column(c: dict[str, Any]) -> Column:
             conv = c.get('conversation')
@@ -165,7 +176,11 @@ class SessionKeeper:
     def restore(self, timer_id: int | None = None) -> None:
         snapshot = read_snapshot(self.path)
         if snapshot is not None:
-            best_effort('restore session', lambda: restore(self.boss, snapshot))
+            journal(self.path, 'restore.log', f'restoring {describe(snapshot)}')
+            report: list[str] = []
+            best_effort('restore session', lambda: restore(self.boss, snapshot, report))
+            for line in report:
+                journal(self.path, 'restore.log', line)
         # Only after the restore, or the half-built strip would be saved over the record.
         self.begin_saving()
 
@@ -217,15 +232,64 @@ def record_from_stdin() -> None:
 
 def record(path: str, tabs: tuple[Tab, ...]) -> None:
     """Add the conversations to kitty's layout and write it, if anything changed."""
-    data = with_conversations(tabs).to_json()
     try:
         with open(path) as f:
-            previous = json.load(f)
-        previous.pop('saved_at', None)
+            previous_file = json.load(f)
     except (OSError, ValueError):
-        previous = None
-    if data != previous:
-        write_atomically(path, json.dumps({'saved_at': time.time(), **data}, ensure_ascii=False, indent=1))
+        previous_file = None
+    previous = {k: v for k, v in previous_file.items() if k != 'saved_at'} if previous_file else None
+    snapshot = with_conversations(tabs, Snapshot.from_json(previous) if previous else Snapshot(()))
+    # Through JSON and back, so tuples compare equal to the lists read from the file.
+    data = json.loads(json.dumps(snapshot.to_json()))
+    if data == previous:
+        return
+    if previous_file is not None and previous is not None:
+        keep_in_history(path, previous_file, losing_sessions=bool(set(previous.get('sessions', {})) - set(data['sessions'])))
+    write_atomically(path, json.dumps({'saved_at': time.time(), **data}, ensure_ascii=False, indent=1))
+    journal(path, 'saves.log', describe(snapshot))
+
+
+# MARK: Leaving a trail
+#
+# When a restore brings back less than was there, the record that drove it has
+# usually been overwritten by then. These keep enough behind to tell whether
+# the record was short or the restore failed.
+
+
+def keep_in_history(path: str, record: dict[str, Any], losing_sessions: bool) -> None:
+    """Keep the record about to be replaced: every HISTORY_EVERY, and always when sessions disappear from it."""
+    history = os.path.join(os.path.dirname(path), 'history')
+    os.makedirs(history, exist_ok=True)
+    kept = sorted(os.listdir(history))
+    if kept and not losing_sessions and time.time() - mtime(os.path.join(history, kept[-1])) < HISTORY_EVERY:
+        return
+    saved_at = record.get('saved_at') or time.time()
+    name = time.strftime('%Y%m%d-%H%M%S', time.localtime(saved_at)) + '.json'
+    write_atomically(os.path.join(history, name), json.dumps(record, ensure_ascii=False, indent=1))
+    for old in sorted(os.listdir(history))[:-HISTORY_KEEP]:
+        with suppress(OSError):
+            os.remove(os.path.join(history, old))
+
+
+def journal(path: str, name: str, line: str) -> None:
+    """Append a timestamped line to a log next to the record, keeping it bounded."""
+    log = os.path.join(os.path.dirname(path), name)
+    with suppress(OSError):
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        if mtime(log) and os.path.getsize(log) > JOURNAL_MAX:
+            with open(log) as f:
+                lines = f.readlines()
+            write_atomically(log, ''.join(lines[len(lines) // 2:]))
+        with open(log, 'a') as f:
+            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n')
+
+
+def describe(snapshot: Snapshot) -> str:
+    columns = [c for t in snapshot.tabs for c in t.columns]
+    panes = [p for ps in snapshot.sessions.values() for p in ps]
+    conversations = sum(p.conversation is not None for p in panes) + sum(c.conversation is not None for c in columns)
+    return (f'tabs={len(snapshot.tabs)} columns={len(columns)} sessions={len(snapshot.sessions)} '
+            f'conversations={conversations} [{" ".join(snapshot.sessions)}]')
 
 
 def _raise(err: Exception) -> None:
@@ -265,8 +329,8 @@ def is_sidebar(group: Any) -> bool:
     return any(w.user_vars.get(SIDEBAR_VAR) for w in group.windows)
 
 
-def with_conversations(tabs: tuple[Tab, ...]) -> Snapshot:
-    """kitty の配置に、tmux の全ペインと、各所で開いている会話を書き足す。"""
+def with_conversations(tabs: tuple[Tab, ...], previous: Snapshot) -> Snapshot:
+    """kitty の配置に、tmux の全ペインと、各所で開いている会話を書き足す。前回の記録にあった会話は、終わっていても覚えておく。"""
     procs = Processes.now()
     panes = list(tmux_panes(procs))
     # Columns not in tmux can run an agent directly (kimi in a kitty window).
@@ -274,25 +338,55 @@ def with_conversations(tabs: tuple[Tab, ...]) -> Snapshot:
         c.pid: a for t in tabs for c in t.columns
         if c.tmux is None and c.pid and (a := agent_in(procs.tree(c.pid), c.cwd, procs)) is not None}
     conversations = identify([p.agent for p in panes if p.agent is not None] + list(column_agents.values()))
-
-    def conversation_of(agent: Agent | None) -> Conversation | None:
-        return conversations.get(agent.pid) if agent is not None else None
+    remembered = Remembered(previous)
 
     sessions: dict[str, list[Pane]] = {}
     for p in panes:
-        # A pane whose agent could not be identified comes back as a shell in
-        # its directory, never as the agent started afresh.
-        command = '' if p.agent is not None else replayable(p.start)
-        sessions.setdefault(p.session, []).append(Pane(p.cwd, p.title, conversation_of(p.agent), command))
+        if p.agent is not None:
+            conv = conversations.get(p.agent.pid)
+            command = ''
+        else:
+            # An agent that exited, or never got going (no network after a
+            # reboot), leaves its pane at a shell. Forgetting its conversation
+            # then would lose it at the next restart.
+            conv = remembered.pane(p.session, p.pid, p.cwd)
+            command = '' if conv else replayable(p.start)
+        sessions.setdefault(p.session, []).append(Pane(p.cwd, p.title, conv, command, p.pid))
     tabs = tuple(
-        replace(t, columns=tuple(replace(c, conversation=conversation_of(column_agents.get(c.pid))) for c in t.columns))
+        replace(t, columns=tuple(
+            c if c.tmux is not None else replace(c, conversation=(
+                conversations.get(column_agents[c.pid].pid) if c.pid in column_agents else remembered.column(c.pid, c.cwd)))
+            for c in t.columns))
         for t in tabs)
     return Snapshot(tabs, {k: tuple(v) for k, v in sessions.items()})
+
+
+class Remembered:
+    """The conversations of the previous record, by the shell that held them.
+
+    A pane's or column's shell keeps its pid while the agent inside it comes
+    and goes, so the pid (with the directory, and for a pane its session) says
+    it is the same place. After a reboot pids start over; the directory and
+    session name keep a reused pid from inheriting someone else's conversation.
+    """
+
+    def __init__(self, previous: Snapshot) -> None:
+        self.panes = {(name, p.pid): p for name, panes in previous.sessions.items() for p in panes if p.pid}
+        self.columns = {c.pid: c for t in previous.tabs for c in t.columns if c.pid}
+
+    def pane(self, session: str, pid: int, cwd: str) -> Conversation | None:
+        p = self.panes.get((session, pid))
+        return p.conversation if p is not None and same_dir(p.cwd, cwd) else None
+
+    def column(self, pid: int, cwd: str) -> Conversation | None:
+        c = self.columns.get(pid)
+        return c.conversation if c is not None and same_dir(c.cwd, cwd) else None
 
 
 @dataclass(frozen=True)
 class LivePane:
     session: str
+    pid: int
     cwd: str
     title: str
     start: str
@@ -303,7 +397,7 @@ def tmux_panes(procs: 'Processes') -> Iterator[LivePane]:
     fmt = '#{session_name}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}\t#{pane_start_command}'
     for line in tmux('list-panes', '-a', '-F', fmt).splitlines():
         name, pid, cwd, title, start = (line.split('\t') + [''] * 5)[:5]
-        yield LivePane(name, cwd, title, start, agent_in(procs.tree(int(pid)), cwd, procs))
+        yield LivePane(name, int(pid), cwd, title, start, agent_in(procs.tree(int(pid)), cwd, procs))
 
 
 def replayable(start_command: str) -> str:
@@ -482,7 +576,7 @@ class Processes:
     @classmethod
     def now(cls) -> 'Processes':
         # One process with a command line that is not UTF-8 must not sink the whole record.
-        out = subprocess.run(['ps', '-axo', 'pid=,ppid=,etime=,command='], capture_output=True, text=True, errors='replace', timeout=5).stdout
+        out = subprocess.run(['ps', '-axo', 'pid=,ppid=,etime=,command='], capture_output=True, text=True, errors='replace', timeout=COMMAND_TIMEOUT).stdout
         now = time.time()
         rows, started = [], {}
         for line in out.splitlines():
@@ -555,13 +649,19 @@ def read_snapshot(path: str) -> Snapshot | None:
 # MARK: Restoring
 
 
-def restore(boss: 'Boss', snapshot: Snapshot) -> None:
-    """会話を tmux に戻してから、kitty のタブとカラムを元の並びで開き直す。"""
-    running = Processes.now().running_conversations()
+def restore(boss: 'Boss', snapshot: Snapshot, report: list[str]) -> None:
+    """会話を tmux に戻してから、kitty のタブとカラムを元の並びで開き直す。何をしたかは report に書く。"""
+    running = conversations_already_open()
     for name, panes in snapshot.sessions.items():
-        best_effort(f'bring back tmux session {name}', lambda: bring_back_session(name, panes, running))
+        outcome = [f'{name}: FAILED (see errors.log)']
+
+        def bring_back(name: str = name, panes: tuple[Pane, ...] = panes, outcome: list[str] = outcome) -> None:
+            outcome[0] = f'{name}: {bring_back_session(name, panes, running)}'
+
+        best_effort(f'bring back tmux session {name}', bring_back)
+        report.append(outcome[0])
     first_tab = boss.active_tab
-    opened = [(tab, kitty_tab) for tab in snapshot.tabs if (kitty_tab := open_tab(boss, tab, running)) is not None]
+    opened = [(tab, kitty_tab) for tab in snapshot.tabs if (kitty_tab := open_tab(boss, tab, running, report)) is not None]
     if opened and first_tab is not None:
         # The tab kitty started with is empty; the restored ones replace it.
         boss.close_tab_no_confirm(first_tab)
@@ -570,24 +670,45 @@ def restore(boss: 'Boss', snapshot: Snapshot) -> None:
             boss.set_active_tab(kitty_tab)
 
 
-def bring_back_session(name: str, panes: tuple[Pane, ...], running: set[str]) -> None:
+def conversations_already_open() -> set[str]:
+    """Which conversations are open somewhere already, so that they are not resumed twice.
+
+    Only a safeguard: after a reboot nothing is open yet. Not knowing must
+    not stop the restore, which is what happened when ps timed out at boot.
+    """
+    found: set[str] = set()
+
+    def look() -> None:
+        found.update(Processes.now().running_conversations())
+
+    best_effort('list the conversations already open (restoring as if none were)', look)
+    return found
+
+
+def bring_back_session(name: str, panes: tuple[Pane, ...], running: set[str]) -> str:
+    """Put one tmux session back, and say what was done."""
+    conversations = sum(p.conversation is not None for p in panes)
     if not tmux_alive(name):
         create_session(name, [(p.cwd, p.restart_command(running)) for p in panes])
-        return
+        return f'recreated, {len(panes)} panes, {conversations} conversations'
     # The session outlived kitty. Leave it alone, except where something
     # recreated it with a bare shell where a conversation should be.
+    resumed = 0
     for index, (pane, current) in enumerate(zip(panes, live_pane_commands(name))):
         if pane.conversation is not None and current in SHELL_NAMES and pane.conversation.id not in running:
-            tmux('send-keys', '-t', f'={name}:{index}', '-l', pane.restart_command(running))
-            tmux('send-keys', '-t', f'={name}:{index}', 'Enter')
+            tmux('send-keys', '-t', f'={name}:{index}', '-l', pane.restart_command(running), check=True)
+            tmux('send-keys', '-t', f'={name}:{index}', 'Enter', check=True)
             running.add(pane.conversation.id)
+            resumed += 1
+    return f'alive, resumed {resumed} in a shell' if resumed else 'alive'
 
 
-def open_tab(boss: 'Boss', tab: Tab, running: set[str]) -> 'KittyTab | None':
+def open_tab(boss: 'Boss', tab: Tab, running: set[str], report: list[str]) -> 'KittyTab | None':
     kitty_tab = None
     for column in tab.columns:
         window = open_column(boss, column, kitty_tab, tab.title, running)
         if window is None:
+            report.append(f'column {column.tmux or column.argv[:1]} in tab {tab.title!r}: not opened, its tmux session is gone')
             continue
         kitty_tab = window.tabref()
         if kitty_tab is not None and column.width is not None:
@@ -625,14 +746,19 @@ def set_column_width(kitty_tab: 'KittyTab', window: Any, cells: int) -> None:
 # MARK: tmux
 
 
-def tmux(*args: str) -> str:
+def tmux(*args: str, check: bool = False) -> str:
     # Always argv, never a shell line: zsh would read "-t =name" as "the path of
     # the command called name".
-    return subprocess.run([tmux_executable(), *args], capture_output=True, text=True, errors='replace', timeout=5).stdout
+    res = subprocess.run([tmux_executable(), *args], capture_output=True, text=True, errors='replace', timeout=COMMAND_TIMEOUT)
+    if check and res.returncode:
+        # A session that silently fails to come back looks exactly like one
+        # that was never recorded.
+        raise RuntimeError(f'tmux {" ".join(args[:4])} failed ({res.returncode}): {res.stderr.strip()}')
+    return res.stdout
 
 
 def tmux_alive(name: str) -> bool:
-    return subprocess.run([tmux_executable(), 'has-session', '-t', f'={name}'], capture_output=True, timeout=5).returncode == 0
+    return subprocess.run([tmux_executable(), 'has-session', '-t', f'={name}'], capture_output=True, timeout=COMMAND_TIMEOUT).returncode == 0
 
 
 def live_pane_commands(name: str) -> list[str]:
@@ -644,7 +770,7 @@ def create_session(name: str, panes: list[tuple[str, str]]) -> None:
         # Through an interactive zsh so the c / x environment (direnv, PATH)
         # is there, and back to a shell when the program exits.
         where = ['new-session', '-d', '-s', name] if index == 0 else ['new-window', '-t', f'={name}:']
-        tmux(*where, '-c', cwd, 'zsh', '-ic', f'{command}; exec zsh')
+        tmux(*where, '-c', cwd, 'zsh', '-ic', f'{command}; exec zsh', check=True)
 
 
 # MARK: Failure policy

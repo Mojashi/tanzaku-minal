@@ -18,7 +18,7 @@ KIMI_ID = 'session_2f2dca16-36fe-46ae-946b-78aca92caa3f'
 
 
 def recording(calls: list[tuple[str, ...]]) -> Callable[..., str]:
-    def tmux(*args: str) -> str:
+    def tmux(*args: str, check: bool = False) -> str:
         calls.append(args)
         return ''
     return tmux
@@ -101,7 +101,7 @@ class TestSessionRestore(TestCase):
 
     def test_a_column_outside_tmux_resumes_its_conversation(self) -> None:
         col = Column(None, None, '/a', ('kimi-code',), pid=9, conversation=Conversation('kimi', KIMI_ID))
-        self.assertEqual(col.launch_command(set()), ['zsh', '-ic', f'cd /a && kimi -S {KIMI_ID}; exec zsh'])
+        self.assertEqual(col.launch_command(set()), ['zsh', '-ic', f'{sr.WAIT_FOR_NETWORK}cd /a && kimi -S {KIMI_ID}; exec zsh'])
         # Already open somewhere else: start the program, do not fork the conversation.
         self.assertNotIn(KIMI_ID, ' '.join(col.launch_command({KIMI_ID})))
 
@@ -159,3 +159,86 @@ class TestSessionRestore(TestCase):
             procs = Processes.now()
         self.assertEqual(run.call_args.kwargs.get('errors'), 'replace')
         self.assertIn(42, procs.cmd)
+
+    def test_every_agent_waits_for_the_network_before_resuming(self) -> None:
+        # Codex started before the network is up after a reboot fails its
+        # account check and exits.
+        for kind in sr.AGENTS:
+            self.assertTrue(Conversation(kind, 'x').resume_in('/a').startswith(sr.WAIT_FOR_NETWORK))
+
+    def test_a_conversation_is_remembered_after_its_agent_exits(self) -> None:
+        previous = Snapshot(
+            (Tab('', (Column(None, None, '/k', ('kimi-code',), pid=30, conversation=Conversation('kimi', KIMI_ID)),)),),
+            {'codex-0921': (Pane('/maic', conversation=Conversation('codex', CODEX_ID), pid=10),)})
+        live = [sr.LivePane('codex-0921', 10, '/maic', 'host', '', None)]
+        tabs = (Tab('', (Column(None, None, '/k', ('zsh',), pid=30),)),)
+        with patch.object(sr.Processes, 'now', return_value=Processes([])), patch.object(sr, 'tmux_panes', return_value=live):
+            snap = sr.with_conversations(tabs, previous)
+        self.assertEqual(snap.sessions['codex-0921'][0].conversation, Conversation('codex', CODEX_ID))
+        self.assertEqual(snap.tabs[0].columns[0].conversation, Conversation('kimi', KIMI_ID))
+
+    def test_a_reused_pid_somewhere_else_does_not_inherit_a_conversation(self) -> None:
+        # After a reboot pids start over; a different session or directory is a different place.
+        previous = Snapshot((), {'codex-0921': (Pane('/maic', conversation=Conversation('codex', CODEX_ID), pid=10),)})
+        live = [sr.LivePane('codex-0921', 10, '/elsewhere', 'host', '', None), sr.LivePane('other', 10, '/maic', 'host', '', None)]
+        with patch.object(sr.Processes, 'now', return_value=Processes([])), patch.object(sr, 'tmux_panes', return_value=live):
+            snap = sr.with_conversations((), previous)
+        self.assertIsNone(snap.sessions['codex-0921'][0].conversation)
+        self.assertIsNone(snap.sessions['other'][0].conversation)
+
+    def test_a_record_losing_sessions_is_always_kept_and_others_only_now_and_then(self) -> None:
+        path = os.path.join(self.tmp.name, 'state', 'last.json')
+        history = os.path.join(self.tmp.name, 'state', 'history')
+        sr.keep_in_history(path, {'saved_at': 1000.0, 'sessions': {'a': []}}, losing_sessions=False)
+        # Just kept one: an ordinary change does not add another...
+        sr.keep_in_history(path, {'saved_at': 1060.0, 'sessions': {'a': []}}, losing_sessions=False)
+        self.assertEqual(len(os.listdir(history)), 1)
+        # ...but sessions going away does.
+        sr.keep_in_history(path, {'saved_at': 1120.0, 'sessions': {'a': [], 'b': []}}, losing_sessions=True)
+        self.assertEqual(len(os.listdir(history)), 2)
+        with patch.object(sr, 'HISTORY_KEEP', 2):
+            sr.keep_in_history(path, {'saved_at': 1180.0, 'sessions': {}}, losing_sessions=True)
+        self.assertEqual(len(os.listdir(history)), 2)
+
+    def test_journal_stays_bounded(self) -> None:
+        path = os.path.join(self.tmp.name, 'state', 'last.json')
+        with patch.object(sr, 'JOURNAL_MAX', 200):
+            for i in range(40):
+                sr.journal(path, 'saves.log', f'line {i}')
+        with open(os.path.join(self.tmp.name, 'state', 'saves.log')) as f:
+            lines = f.read().splitlines()
+        self.assertLess(len(lines), 40)
+        self.assertTrue(lines[-1].endswith('line 39'))
+
+    def test_saving_leaves_a_line_saying_what_was_recorded(self) -> None:
+        path = os.path.join(self.tmp.name, 'state', 'last.json')
+        snap = Snapshot((Tab('', (Column(None, tmux='codex-1'),)),), {'codex-1': (Pane('/a', conversation=Conversation('codex', CODEX_ID)),)})
+        with patch.object(sr, 'with_conversations', return_value=snap):
+            sr.record(path, snap.tabs)
+            sr.record(path, snap.tabs)  # unchanged: no second line
+        with open(os.path.join(self.tmp.name, 'state', 'saves.log')) as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn('tabs=1 columns=1 sessions=1 conversations=1 [codex-1]', lines[0])
+
+    def test_a_session_that_fails_to_come_back_is_an_error_not_silence(self) -> None:
+        failed = subprocess.CompletedProcess([], 1, '', 'no server running')
+        with patch('subprocess.run', return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, 'no server running'):
+                sr.create_session('codex-1', [('/a', 'codex')])
+
+    def test_bringing_back_a_session_says_what_was_done(self) -> None:
+        panes = (Pane('/a', conversation=Conversation('codex', CODEX_ID)),)
+        with patch.object(sr, 'tmux_alive', return_value=False), patch.object(sr, 'tmux', side_effect=recording([])):
+            self.assertEqual(sr.bring_back_session('codex-1', panes, set()), 'recreated, 1 panes, 1 conversations')
+        with patch.object(sr, 'tmux_alive', return_value=True), patch.object(sr, 'live_pane_commands', return_value=['zsh']), \
+                patch.object(sr, 'tmux', side_effect=recording([])):
+            self.assertEqual(sr.bring_back_session('codex-1', panes, set()), 'alive, resumed 1 in a shell')
+
+    def test_restore_goes_on_when_ps_is_too_slow_at_boot(self) -> None:
+        timeout = subprocess.TimeoutExpired(['ps'], 30)
+        with patch.object(sr.Processes, 'now', side_effect=timeout), \
+                patch.object(sr, 'ERROR_LOG', os.path.join(self.tmp.name, 'errors.log')), patch('kitty.utils.log_error'):
+            self.assertEqual(sr.conversations_already_open(), set())
+        with open(os.path.join(self.tmp.name, 'errors.log')) as f:
+            self.assertIn('restoring as if none were', f.read())
